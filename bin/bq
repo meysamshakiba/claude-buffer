@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# bq — queue a task without needing a Claude session.
+# Works when you are locked out, which is the entire point.
+#
+#   bq "fix the off-by-one in axi_fifo.sv line 214"
+#   bq            # show queue + daemon status
+#   bq log        # tail the daemon log
+#   bq stop
+set -euo pipefail
+SKILL="${BUFFER_SKILL_DIR:-$HOME/.claude/skills/buffer}"
+PY="${PYTHON:-python3}"
+
+case "${1:-}" in
+  "")     "$PY" "$SKILL/scripts/buffer_queue.py" list
+          "$PY" "$SKILL/scripts/drain.py" --status ;;
+  log)    "$PY" "$SKILL/scripts/drain.py" --tail "${2:-30}" ;;
+  stop)   "$PY" "$SKILL/scripts/drain.py" --stop ;;
+  status) "$PY" "$SKILL/scripts/buffer_queue.py" status
+          "$PY" "$SKILL/scripts/drain.py" --status ;;
+  *)      "$PY" "$SKILL/scripts/buffer_queue.py" add "$*"
+          # Make sure something will actually run it.
+          "$PY" "$SKILL/scripts/drain.py" --status >/dev/null 2>&1 \
+            || "$PY" "$SKILL/scripts/drain.py" --daemon --watch ;;
+esac

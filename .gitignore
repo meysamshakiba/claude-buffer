@@ -1,0 +1,12 @@
+# build artifact — produced from this tree, published as a release asset
+buffer-skill.zip
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# local queue state, if CLAUDE_BUFFER_QUEUE points into the repo
+.claude/buffer/
+*.tmp
+.*.lock

@@ -1,0 +1,4 @@
+# bin/bq ships as a shell script; a CRLF checkout breaks its shebang on POSIX.
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.zip binary
