@@ -374,13 +374,28 @@ def main() -> int:
         elif args.cmd == "reset":
             emit({"requeued": q.reset_running()}, args.json)
         elif args.cmd == "done":
-            emit(q.set_status(args.id, "done"), args.json)
+            t = q.set_status(args.id, "done")
+            if not t:
+                print(f"no such task: {args.id}", file=sys.stderr)
+                return 1
+            emit(t, args.json)
         elif args.cmd == "fail":
-            emit(q.set_status(args.id, "failed", args.note or "failed"), args.json)
+            t = q.set_status(args.id, "failed", args.note or "failed")
+            if not t:
+                print(f"no such task: {args.id}", file=sys.stderr)
+                return 1
+            emit(t, args.json)
         elif args.cmd == "requeue":
-            emit(q.set_status(args.id, "pending", ""), args.json)
+            t = q.set_status(args.id, "pending", "")
+            if not t:
+                print(f"no such task: {args.id}", file=sys.stderr)
+                return 1
+            emit(t, args.json)
         elif args.cmd == "remove":
-            emit({"removed": q.remove(args.id)}, args.json)
+            if not q.remove(args.id):
+                print(f"no such task: {args.id}", file=sys.stderr)
+                return 1
+            emit({"removed": True}, args.json)
         elif args.cmd == "status":
             emit({"queue": str(path), **q.counts()}, args.json)
         elif args.cmd == "list":
