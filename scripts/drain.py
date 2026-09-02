@@ -103,6 +103,55 @@ def pid_file() -> Path:
     return state_dir() / "drain.pid"
 
 
+def state_file() -> Path:
+    return state_dir() / "drain.state"
+
+
+def set_state(**kw) -> None:
+    """Publish what the daemon is doing.
+
+    Sleeping off a limit and being wedged look identical from the queue: the
+    task sits at [~] and nothing happens for hours. That ambiguity reads as a
+    broken tool at exactly the moment the tool is doing its job, so the daemon
+    says so out loud. Best effort — bookkeeping must never break the drain.
+    """
+    try:
+        state_file().write_text(
+            json.dumps({"pid": os.getpid(), **kw}), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def read_state() -> dict:
+    try:
+        return json.loads(state_file().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+def describe_state(state: dict, now: float | None = None) -> str:
+    """One line for `bq`, or empty when there is nothing worth saying."""
+    now = time.time() if now is None else now
+    kind = state.get("state")
+    task = f" [{state['task']}]" if state.get("task") else ""
+
+    if kind == "sleeping":
+        left = int(state.get("until", 0) - now)
+        if left > 0:
+            when = datetime.fromtimestamp(state["until"]).strftime("%a %H:%M")
+            reason = state.get("reason", "limit")
+            return (f"waiting out the {reason} until {when} "
+                    f"({left // 60}m left), then resumes{task}")
+        return f"reset reached; picking{task} back up"
+    if kind == "running":
+        for_min = int((now - state.get("since", now)) // 60)
+        return f"running{task} for {for_min}m"
+    if kind == "idle":
+        return "idle, watching for new tasks"
+    return ""
+
+
 def log_file() -> Path:
     return state_dir() / "drain.log"
 
@@ -187,6 +236,7 @@ def stop_daemon() -> int:
     else:
         os.kill(pid, signal.SIGTERM)
     pid_file().unlink(missing_ok=True)
+    state_file().unlink(missing_ok=True)
     log(f"Stopped daemon (pid {pid}). In-flight task returns to pending on next start.")
     return 0
 
@@ -419,6 +469,7 @@ def drain(args, path: Path) -> int:
             if recovered:
                 log(f"Recovered {recovered} abandoned task(s) from another worker.")
                 continue
+            set_state(state="idle", since=int(time.time()))
             time.sleep(args.poll)
             continue
 
@@ -438,6 +489,7 @@ def drain(args, path: Path) -> int:
             log(f"Running [{tid}]{where} {text}")
             resume_sid = chain_session if args.chain else None
 
+        set_state(state="running", task=tid, since=int(time.time()))
         with heartbeating(path, tid, WORKER_ID):
             ok, output, session_id, harness = run_task(
                 prompt, args.cli, args.claude_arg, args.timeout, resume_sid,
@@ -496,10 +548,17 @@ def drain(args, path: Path) -> int:
 
             queue_op(path, lambda q: q.set_status(tid, "pending", ""))
             if reset_epoch:
+                set_state(state="sleeping", task=tid, until=reset_epoch + 60,
+                          reason=f"{kind} limit")
                 if not sleep_until(reset_epoch, kind, args.max_sleep):
+                    set_state(state="stopped", task=tid,
+                              reason=f"{kind} limit resets beyond --max-sleep")
                     return 2
             else:
                 log(f"Limit hit, reset time unknown. Sleeping {DEFAULT_BACKOFF // 60}m.")
+                set_state(state="sleeping", task=tid,
+                          until=int(time.time()) + DEFAULT_BACKOFF,
+                          reason="limit, reset time unknown")
                 time.sleep(DEFAULT_BACKOFF)
             continue
 
@@ -555,8 +614,14 @@ def main() -> int:
 
     if args.status:
         pid = daemon_pid()
-        print(f"daemon running (pid {pid})" if pid else "no daemon running")
-        return 0 if pid else 1
+        if not pid:
+            print("no daemon running")
+            return 1
+        print(f"daemon running (pid {pid})")
+        doing = describe_state(read_state())
+        if doing:
+            print(f"  {doing}")
+        return 0
 
     if args.tail is not None:
         lf = log_file()
