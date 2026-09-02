@@ -79,6 +79,18 @@ running `--dangerously-skip-permissions` will do anything the queue contains.
 **Queued work gets the same judgment as typed work.** Nobody is watching, which
 raises the bar rather than lowering it — irreversible steps still wait for you.
 
+## Development
+
+```bash
+pip install pytest ruff
+python -m pytest        # 26 tests, no network, no `claude` needed
+python -m ruff check scripts tests
+```
+
+CI runs the suite on Linux, macOS and Windows across Python 3.10 and 3.13 —
+the locking, liveness and detachment paths differ per platform, so the matrix
+is doing real work.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
