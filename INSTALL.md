@@ -149,7 +149,36 @@ started anywhere serves every project. A task queued before this existed, or
 from a directory since deleted, runs wherever the daemon is -- with a line in
 the log saying so.
 
-## 5. Don't wait at all (optional)
+## 5. Capturing work when you're away
+
+`bq` needs a terminal and `/buffer` needs a live Claude session. Both are on the
+machine, and a usage limit takes the session away -- so the moment you most need
+to record an idea is the moment both ingresses are gone.
+
+Nothing outside Claude can push a message into a Claude session; input to a
+Remote Control session flows cloud to laptop, one way. So the ingress is
+something the daemon reads instead:
+
+```
+~/.claude/buffer/inbox/        drop a file here; it becomes a task
+~/.claude/buffer/inbox/done/   where it goes once queued
+```
+
+One file, one task; the text is the prompt. An optional first line `cwd: <path>`
+says where to run it. Files are archived rather than deleted, so a bad enqueue
+is still readable. A file younger than a few seconds is left alone, because a
+sync client may still be writing it and half an idea cannot be repaired later.
+
+That makes the transport your choice -- anything that can write a file:
+
+- a folder synced from your phone (Dropbox, OneDrive, Syncthing) pointed at the
+  inbox with `CLAUDE_BUFFER_INBOX`
+- a chat bot that appends what you send it
+- `scp`, a cron job, a Shortcut, an email fetcher
+
+The queue then does what it always did: one at a time, in order, through limits.
+
+## 6. Don't wait at all (optional)
 
 API billing is metered separately from your subscription, so a locked-out
 subscription doesn't block an API key:
@@ -172,7 +201,7 @@ effect on a daemon that's already running.
 On a usage limit the daemon retries the task on the API key instead of sleeping.
 This costs money per token — that's the trade. Without the flag it just waits.
 
-## 6. Flags
+## 7. Flags
 
 | Flag | Why |
 |---|---|
@@ -195,7 +224,7 @@ Everything after `--` goes straight to the CLI. `--claude-arg` takes a single
 value and needs `--claude-arg=--flag` for anything starting with a dash, so `--`
 is usually what you want.
 
-## 7. Windows notes
+## 8. Windows notes
 
 Supported natively. You install `bin\bq.cmd` rather than `bin/bq`, but you
 still *type* `bq` — PowerShell and cmd resolve it through `PATHEXT`.

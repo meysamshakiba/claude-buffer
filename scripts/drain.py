@@ -90,6 +90,7 @@ RESUME_FAILED_RE = re.compile(
 # would retry forever. Bound it: past this many, treat it as a real failure.
 MAX_LIMIT_HITS = 5
 HEARTBEAT_EVERY = 300              # well inside STALE_AFTER, cheap to write
+INBOX_SETTLE = 5                   # let a syncing file finish landing
 WORKER_ID = f"drain-{default_worker()}"
 
 
@@ -405,6 +406,71 @@ def run_task(text: str, cli: str, extra: list[str], timeout: int,
     return proc.returncode == 0, combined, session_id, harness
 
 
+def inbox_dir() -> Path:
+    env = os.environ.get("CLAUDE_BUFFER_INBOX")
+    return Path(env).expanduser() if env else state_dir() / "inbox"
+
+
+def ingest_inbox(path: Path, settle: float = INBOX_SETTLE) -> int:
+    """Turn files dropped in the inbox into queued tasks.
+
+    Capture is the part that breaks down when you are over Claude's pace: `bq`
+    needs a terminal and `/buffer` needs a live session, and a usage limit takes
+    the session away. Nothing outside can push into a Claude session, so the
+    ingress has to be something the daemon reads instead — and a directory is
+    the most generic version of that. Anything able to write a file becomes a
+    way to queue work: a synced folder from a phone, a bot, scp, a cron job.
+
+    One file, one task. First line may be `cwd: <path>` to say where it runs.
+    """
+    inbox = inbox_dir()
+    if not inbox.is_dir():
+        return 0
+
+    done = inbox / "done"
+    now = time.time()
+    added = 0
+
+    for item in sorted(inbox.iterdir(), key=lambda p: p.name):
+        if item.is_dir() or item.name.startswith("."):
+            continue
+        # A file arriving over a sync client or a slow pipe may still be being
+        # written. Reading it now would queue half an idea, and the task text
+        # is not something we can repair later.
+        if now - item.stat().st_mtime < settle:
+            continue
+
+        try:
+            raw = item.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError as exc:
+            log(f"Inbox: cannot read {item.name}: {exc}")
+            continue
+
+        cwd = None
+        if raw.lower().startswith("cwd:"):
+            head, _, rest = raw.partition("\n")
+            cwd = head[4:].strip() or None
+            raw = rest.strip()
+
+        if not raw:
+            log(f"Inbox: {item.name} is empty; ignoring.")
+        else:
+            task = queue_op(path, lambda q: q.add(raw, cwd))
+            if task is None:
+                continue  # queue busy; leave the file and retry next pass
+            added += 1
+            log(f"Inbox: queued [{task['id']}] from {item.name}")
+
+        # Move rather than delete: if the enqueue was wrong, the original text
+        # is still there to look at.
+        try:
+            done.mkdir(parents=True, exist_ok=True)
+            item.replace(done / f"{int(now)}-{item.name}")
+        except OSError as exc:
+            log(f"Inbox: queued {item.name} but could not archive it: {exc}")
+    return added
+
+
 @contextlib.contextmanager
 def heartbeating(path: Path, tid: str, worker: str):
     """Keep saying the claim is alive while a task runs.
@@ -456,6 +522,10 @@ def drain(args, path: Path) -> int:
     chain_session: str | None = None
 
     while True:
+        # Before claiming, so anything dropped while the last task ran joins
+        # the queue in the order it arrived rather than waiting for an idle moment.
+        ingest_inbox(path)
+
         task = queue_op(path, lambda q: q.claim(WORKER_ID))
 
         if task is None:

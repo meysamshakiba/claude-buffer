@@ -74,6 +74,12 @@ will fail; "fix the off-by-one in axi_fifo.sv line 214" will not.
 nothing about task 1. `--chain` threads them together at the cost of a poisoned
 early session infecting the rest.
 
+**Anything that can write a file can queue work.** Drop a file in
+`~/.claude/buffer/inbox/` and the daemon turns it into a task. `bq` needs a
+terminal and `/buffer` needs a live session; a synced folder from your phone
+needs neither, which matters because a usage limit removes the session exactly
+when you wanted to jot the idea down.
+
 **It runs where you queued it.** Each task records the directory it came from,
 so one daemon serves every project and you never tell it a path.
 
