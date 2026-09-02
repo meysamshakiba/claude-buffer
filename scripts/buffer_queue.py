@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Durable FIFO task queue backed by a human-editable markdown file.
 
-Line format (one task per line), with an optional percent-encoded note:
+Line format (one task per line). Everything after "| " is task text, verbatim
+to end of line; the optional metadata fields before it are percent-encoded:
+
     - [ ] id=a1b2c3d4 ts=2026-08-30T14:03:11Z | do task1
     - [!] id=b2c3d4e5 ts=2026-08-30T14:05:02Z note=timed%20out | do task2
+    - [ ] id=c3d4e5f6 ts=2026-08-30T14:07:40Z session=abc-123 | do task3
 
-Everything after "| " is task text, verbatim to end of line.
+`session` is set when a usage limit interrupts an attempt: it names the CLI
+conversation to resume so the retry picks up where it stopped.
 
 Status markers:
     [ ]  pending
@@ -124,7 +128,7 @@ HEADER = f"# Buffer queue\n\n{FORMAT_MARKER}\n\n"
 
 LINE_RE = re.compile(
     r"^- \[(?P<mark>[ ~x!])\] id=(?P<id>\w+) ts=(?P<ts>\S+)"
-    r"(?: note=(?P<note>\S*))? \| (?P<text>.*)$"
+    r"(?: note=(?P<note>\S*))?(?: session=(?P<session>\S*))? \| (?P<text>.*)$"
 )
 LINE_RE_V1 = re.compile(
     r"^- \[(?P<mark>[ ~x!])\] id=(?P<id>\w+) ts=(?P<ts>\S+) \| (?P<text>.*?)(?: # (?P<note>.*))?$"
@@ -190,6 +194,7 @@ class Queue:
             m = pattern.match(line.rstrip())
             if m:
                 note = m.group("note")
+                session = m.group("session") if v2 else None
                 tasks.append(
                     {
                         "id": m.group("id"),
@@ -197,6 +202,7 @@ class Queue:
                         "ts": m.group("ts"),
                         "text": m.group("text"),
                         "note": unquote(note) if (v2 and note is not None) else note,
+                        "session": unquote(session) if session else None,
                     }
                 )
         return tasks
@@ -205,9 +211,10 @@ class Queue:
         # quote() with no safe characters keeps the note free of spaces and
         # "|", so it can't be confused with the text that follows it.
         note = f" note={quote(t['note'], safe='')}" if t.get("note") else ""
+        session = f" session={quote(t['session'], safe='')}" if t.get("session") else ""
         return (
             f"- [{CHAR_FOR_STATUS[t['status']]}] id={t['id']} "
-            f"ts={t['ts']}{note} | {t['text']}"
+            f"ts={t['ts']}{note}{session} | {t['text']}"
         )
 
     def save(self) -> None:
@@ -232,9 +239,21 @@ class Queue:
             "ts": now_iso(),
             "text": text.strip().replace("\n", " "),
             "note": None,
+            "session": None,
         }
         self.tasks.append(task)
         self.save()
+        return task
+
+    def set_session(self, task_id: str, session: str | None) -> dict | None:
+        """Remember the CLI session an interrupted attempt was using, so the
+        retry can resume that conversation instead of starting cold. Lives in
+        the queue file rather than in the worker's memory because the wait for
+        a reset can outlast the worker (see --max-sleep)."""
+        task = self.find(task_id)
+        if task:
+            task["session"] = session
+            self.save()
         return task
 
     def find(self, task_id: str) -> dict | None:

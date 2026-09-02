@@ -60,6 +60,23 @@ LIMIT_TEXT_RE = re.compile(
 DEFAULT_BACKOFF = 15 * 60          # reset time unknown
 DEFAULT_MAX_SLEEP = 6 * 3600       # refuse to silently sleep longer than this
 CLOCK_GRACE = timedelta(minutes=10)  # a reset this recently past has passed
+
+# Sent when resuming a task the limit cut short. The conversation being resumed
+# already contains the original request and whatever work got done, so repeating
+# the task verbatim would invite starting over.
+RESUME_PROMPT = (
+    "You were interrupted by a usage limit partway through this task:\n\n"
+    "{text}\n\n"
+    "The conversation above is your own work on it so far. Continue from where "
+    "you stopped: finish what is unfinished, and don't redo what is already done."
+)
+# A stored session that the CLI won't resume — expired, pruned, or from another
+# machine — must not strand the task on a conversation that no longer exists.
+RESUME_FAILED_RE = re.compile(
+    r"(no conversation found|session .{0,60}?not found"
+    r"|could not resume|invalid session|--resume)",
+    re.IGNORECASE,
+)
 # A limit doesn't count against a task's retries, so a task misread as limited
 # would retry forever. Bound it: past this many, treat it as a real failure.
 MAX_LIMIT_HITS = 5
@@ -355,13 +372,31 @@ def drain(args, path: Path) -> int:
 
         tid, text = task["id"], task["text"]
         attempts[tid] = attempts.get(tid, 0) + 1
-        log(f"Running [{tid}] {text}")
+
+        # A limit that cut a previous attempt short left its conversation id on
+        # the task. Resuming it means the retry continues the same chat with the
+        # work already done still in view, rather than starting the task over.
+        resume_sid = task.get("session")
+        prompt = RESUME_PROMPT.format(text=text) if resume_sid else text
+        if resume_sid:
+            log(f"Resuming [{tid}] in session {resume_sid}")
+        else:
+            log(f"Running [{tid}] {text}")
+            resume_sid = chain_session if args.chain else None
 
         ok, output, session_id, harness = run_task(
-            text, args.cli, args.claude_arg, args.timeout,
-            chain_session if args.chain else None,
+            prompt, args.cli, args.claude_arg, args.timeout, resume_sid,
         )
         reset_epoch, kind = detect_limit(output, failed=not ok, harness_text=harness)
+
+        # Don't let a conversation the CLI won't reopen strand the task; drop it
+        # and the next attempt starts cold, which is the old behaviour.
+        if not ok and task.get("session") and RESUME_FAILED_RE.search(harness):
+            log(f"Session {task['session']} could not be resumed; retrying cold.")
+            queue_op(path, lambda q: q.set_session(tid, None))
+            queue_op(path, lambda q: q.set_status(tid, "pending", "resume failed"))
+            attempts[tid] -= 1
+            continue
 
         # Repeatedly "limited" without ever running is indistinguishable from a
         # misdetection, and limits don't consume retries — so this task would
@@ -376,17 +411,27 @@ def drain(args, path: Path) -> int:
             attempts[tid] -= 1  # a limit is not the task's fault
             limit_hits[tid] = limit_hits.get(tid, 0) + 1
 
+            # Whatever conversation the interrupted attempt was using is where
+            # the half-finished work lives. Record it on the task so the retry
+            # resumes it — after a wait that may outlive this process.
+            interrupted = session_id or resume_sid
+            if interrupted:
+                queue_op(path, lambda q: q.set_session(tid, interrupted))
+                log(f"Will resume [{tid}] in session {interrupted} after the reset.")
+
             # Subscription window is exhausted. If an API key is configured,
             # keep working on metered billing instead of sleeping.
             if args.fallback_api_key and os.environ.get("BUFFER_FALLBACK_API_KEY"):
                 log(f"{kind} limit hit — retrying [{tid}] on API-key billing.")
                 ok, output, session_id, harness = run_task(
-                    text, args.cli, args.claude_arg, args.timeout,
-                    chain_session if args.chain else None, use_api_key=True,
+                    RESUME_PROMPT.format(text=text) if interrupted else text,
+                    args.cli, args.claude_arg, args.timeout,
+                    interrupted, use_api_key=True,
                 )
                 if ok:
                     if args.chain and session_id:
                         chain_session = session_id
+                    queue_op(path, lambda q: q.set_session(tid, None))
                     queue_op(path, lambda q: q.set_status(tid, "done", "via api key"))
                     log(f"Done [{tid}] (api key)")
                     continue
@@ -400,6 +445,11 @@ def drain(args, path: Path) -> int:
                 log(f"Limit hit, reset time unknown. Sleeping {DEFAULT_BACKOFF // 60}m.")
                 time.sleep(DEFAULT_BACKOFF)
             continue
+
+        # The task is off the limit path either way now, so the stored session
+        # has done its job. Leaving it would resume a finished conversation.
+        if task.get("session"):
+            queue_op(path, lambda q: q.set_session(tid, None))
 
         if ok:
             if args.chain and session_id:

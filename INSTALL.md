@@ -100,6 +100,10 @@ It detaches from the terminal, so closing the terminal or losing the Claude
 session doesn't kill it. While waiting for a reset it's an idle OS process —
 zero tokens, zero context.
 
+When the reset arrives it reopens the conversation the interrupted task was in,
+rather than running it again from scratch. Nothing to configure; you'll see
+`Resuming [id] in session ...` in the log.
+
 State lives together, in `~/.claude/buffer/` — on Windows,
 `%USERPROFILE%\.claude\buffer\`:
 

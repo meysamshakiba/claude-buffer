@@ -17,8 +17,10 @@ that process **stops**. There is no Claude left to wait out the reset.
 
 The way around this is `scripts/drain.py --daemon`: an ordinary detached OS
 process, not a Claude session. It holds no context and burns no tokens while it
-sleeps. When the reset arrives it spawns *fresh* `claude -p` sessions to run the
-queued tasks. It survives the terminal closing and the session that started it.
+sleeps. When the reset arrives it runs the queued tasks through `claude -p` —
+reopening the conversation it was interrupted in, or starting a fresh one for a
+task not yet begun. It survives the terminal closing and the session that
+started it.
 
 | Part | Who | Survives a limit? |
 |---|---|---|
@@ -113,6 +115,15 @@ something you may not finish.
 session, so task2 knows nothing about task1. If the tasks build on each other,
 `--chain` threads them into one session via `--resume`. Default is off, because
 chained context grows and a poisoned early session then infects the rest.
+
+**An interrupted task resumes its own conversation.** If a limit stops a task
+halfway, the daemon records which session it was in and reopens that same chat
+after the reset, so the half-finished work is still in view and the task carries
+on instead of starting over. Automatic, and separate from `--chain` — that
+threads *different* tasks together, this repairs *one* task. The session id
+lives on the task in `queue.md`, so it survives the daemon being stopped
+mid-wait. If the conversation can't be reopened, the task runs cold rather than
+stalling on a chat that no longer exists.
 
 **Two clocks.** Session limits reset in hours; weekly limits can be days out.
 `--max-sleep` (default 6h) stops the daemon rather than letting it silently

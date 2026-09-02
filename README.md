@@ -20,8 +20,9 @@ that process **stops** — there is no Claude left to wait out the reset.
 
 `scripts/drain.py --daemon` is an ordinary detached OS process, not a Claude
 session. It holds no context and burns no tokens while it sleeps. When the reset
-arrives it spawns fresh `claude -p` sessions to run the queued tasks. It
-survives the terminal closing and the session that started it.
+arrives it runs the queued tasks through `claude -p`, reopening the conversation
+it was interrupted in. It survives the terminal closing and the session that
+started it.
 
 | Part | Who | Survives a limit? |
 |---|---|---|
@@ -72,6 +73,11 @@ will fail; "fix the off-by-one in axi_fifo.sv line 214" will not.
 **Tasks are independent by default.** Each is a fresh session, so task 2 knows
 nothing about task 1. `--chain` threads them together at the cost of a poisoned
 early session infecting the rest.
+
+**A task the limit cut in half resumes its own chat.** The daemon records the
+session and reopens it after the reset, so the task continues rather than
+starting over. The id is stored on the task in `queue.md`, so this holds even
+if the daemon is stopped during the wait.
 
 **Scope permissions per task, not globally.** An unattended overnight queue
 running `--dangerously-skip-permissions` will do anything the queue contains.
