@@ -59,6 +59,10 @@ LIMIT_TEXT_RE = re.compile(
 
 DEFAULT_BACKOFF = 15 * 60          # reset time unknown
 DEFAULT_MAX_SLEEP = 6 * 3600       # refuse to silently sleep longer than this
+CLOCK_GRACE = timedelta(minutes=10)  # a reset this recently past has passed
+# A limit doesn't count against a task's retries, so a task misread as limited
+# would retry forever. Bound it: past this many, treat it as a real failure.
+MAX_LIMIT_HITS = 5
 
 
 def state_dir() -> Path:
@@ -189,23 +193,36 @@ def parse_clock(when: str) -> int | None:
         return None
 
     now = datetime.now()
+    # A reset time a little in the past has just passed — clock skew against
+    # the server, or the message sat in a buffer for a moment. Rolling those
+    # forward a whole day makes the daemon wait ~24h for a limit that has
+    # already lifted, or exceed --max-sleep and quit outright. Treat the
+    # recent past as now and let sleep_until fall through to an immediate retry.
+    cutoff = now - CLOCK_GRACE
     candidate = now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
     if target_dow is not None:
         delta = (target_dow - candidate.weekday()) % 7
         candidate += timedelta(days=delta)
-        if candidate <= now:
+        if candidate <= cutoff:
             candidate += timedelta(days=7)
-    elif candidate <= now:
+    elif candidate <= cutoff:
         candidate += timedelta(days=1)
     return int(candidate.timestamp())
 
 
-def detect_limit(text: str, failed: bool = True) -> tuple[int | None, str]:
+def detect_limit(
+    text: str, failed: bool = True, harness_text: str | None = None
+) -> tuple[int | None, str]:
     """Returns (reset_epoch | 0 | None, kind).
 
     0 means "limit hit, reset time unknown". None means "not a limit".
-    The fuzzy text form only counts when the command actually failed — a task
-    whose output happens to discuss rate limiting would otherwise match it.
+
+    The epoch and clock forms are specific enough to trust anywhere in the
+    output. The fuzzy text form is not: phrases like "429 too many requests"
+    show up in the output of any task that touches an HTTP client, and reading
+    one as a usage limit puts the daemon to sleep on a schedule of its own
+    invention. So it is matched only against `harness_text` — the channel the
+    CLI itself speaks on — and only when the command actually failed.
     """
     m = LIMIT_EPOCH_RE.search(text)
     if m:
@@ -216,7 +233,8 @@ def detect_limit(text: str, failed: bool = True) -> tuple[int | None, str]:
         epoch = parse_clock(m.group("when"))
         return (epoch or 0), (m.group("kind") or "session").lower()
 
-    if failed and LIMIT_TEXT_RE.search(text):
+    fuzzy = text if harness_text is None else harness_text
+    if failed and LIMIT_TEXT_RE.search(fuzzy):
         return 0, "unknown"
     return None, ""
 
@@ -249,8 +267,14 @@ def sleep_until(epoch: int, kind: str, max_sleep: int, pad: int = 60) -> bool:
 
 
 def run_task(text: str, cli: str, extra: list[str], timeout: int,
-             resume: str | None, use_api_key: bool = False) -> tuple[bool, str, str | None]:
-    """Run one task. Returns (ok, combined_output, session_id).
+             resume: str | None,
+             use_api_key: bool = False) -> tuple[bool, str, str | None, str]:
+    """Run one task. Returns (ok, combined_output, session_id, harness_output).
+
+    harness_output is the subset of the output the CLI itself produced —
+    stderr, plus the result payload when it is flagged as an error. Task prose
+    lands in stdout, so keeping the two apart is what stops a task that merely
+    *discusses* rate limits from being mistaken for one (see detect_limit).
 
     With use_api_key, run against BUFFER_FALLBACK_API_KEY instead of the
     subscription. API billing is metered separately, so this keeps working
@@ -271,11 +295,14 @@ def run_task(text: str, cli: str, extra: list[str], timeout: int,
             encoding="utf-8", errors="replace", env=env,
         )
     except FileNotFoundError:
-        return False, f"`{cli}` not found on PATH", None
+        msg = f"`{cli}` not found on PATH"
+        return False, msg, None, msg
     except subprocess.TimeoutExpired:
-        return False, f"timed out after {timeout}s", None
+        msg = f"timed out after {timeout}s"
+        return False, msg, None, msg
 
     combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    harness = proc.stderr or ""
     session_id = None
     result_text = ""
     try:
@@ -284,12 +311,13 @@ def run_task(text: str, cli: str, extra: list[str], timeout: int,
         result_text = payload.get("result") or ""
         if payload.get("is_error"):
             combined += "\n" + str(result_text)
+            harness += "\n" + str(result_text)
     except (json.JSONDecodeError, AttributeError, TypeError):
         result_text = (proc.stdout or "").strip()
 
     if result_text:
         print(str(result_text).rstrip()[:4000], flush=True)
-    return proc.returncode == 0, combined, session_id
+    return proc.returncode == 0, combined, session_id, harness
 
 
 def queue_op(path: Path, fn, retries: int = 3):
@@ -312,6 +340,7 @@ def drain(args, path: Path) -> int:
         log(f"Requeued {n} interrupted task(s).")
 
     attempts: dict[str, int] = {}
+    limit_hits: dict[str, int] = {}
     chain_session: str | None = None
 
     while True:
@@ -328,20 +357,30 @@ def drain(args, path: Path) -> int:
         attempts[tid] = attempts.get(tid, 0) + 1
         log(f"Running [{tid}] {text}")
 
-        ok, output, session_id = run_task(
+        ok, output, session_id, harness = run_task(
             text, args.cli, args.claude_arg, args.timeout,
             chain_session if args.chain else None,
         )
-        reset_epoch, kind = detect_limit(output, failed=not ok)
+        reset_epoch, kind = detect_limit(output, failed=not ok, harness_text=harness)
+
+        # Repeatedly "limited" without ever running is indistinguishable from a
+        # misdetection, and limits don't consume retries — so this task would
+        # hold the head of the queue forever. Call it a failure and move on.
+        if reset_epoch is not None and limit_hits.get(tid, 0) >= MAX_LIMIT_HITS:
+            note = f"limit detected {MAX_LIMIT_HITS}x without progress; giving up"
+            queue_op(path, lambda q: q.set_status(tid, "failed", note))
+            log(f"Giving up on [{tid}]: {note}")
+            continue
 
         if reset_epoch is not None:
             attempts[tid] -= 1  # a limit is not the task's fault
+            limit_hits[tid] = limit_hits.get(tid, 0) + 1
 
             # Subscription window is exhausted. If an API key is configured,
             # keep working on metered billing instead of sleeping.
             if args.fallback_api_key and os.environ.get("BUFFER_FALLBACK_API_KEY"):
                 log(f"{kind} limit hit — retrying [{tid}] on API-key billing.")
-                ok, output, session_id = run_task(
+                ok, output, session_id, harness = run_task(
                     text, args.cli, args.claude_arg, args.timeout,
                     chain_session if args.chain else None, use_api_key=True,
                 )
