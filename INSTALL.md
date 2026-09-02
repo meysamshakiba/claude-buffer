@@ -104,6 +104,14 @@ When the reset arrives it reopens the conversation the interrupted task was in,
 rather than running it again from scratch. Nothing to configure; you'll see
 `Resuming [id] in session ...` in the log.
 
+One queue, many writers - `bq`, the daemon, and any Claude session draining
+inline all share it. A claim records who took it and keeps a heartbeat, so
+`bq` shows you `<- drain-host:9182, last seen 2m ago` rather than a bare `[~]`
+you cannot interpret. Anything that stops checking in for `--stale-after` is
+treated as abandoned and retried; anything still checking in is left alone.
+That is also why `reset` no longer requeues everything - pass `--force` for the
+old behaviour, and only when you know you are the only worker.
+
 State lives together, in `~/.claude/buffer/` — on Windows,
 `%USERPROFILE%\.claude\buffer\`:
 
@@ -144,6 +152,7 @@ This costs money per token — that's the trade. Without the flag it just waits.
 | `--fallback-api-key` | Keep working through a lockout on metered billing |
 | `--chain` | Thread tasks into one session so task2 sees task1's work |
 | `--max-sleep 21600` | Stop rather than sleep past this (weekly-limit guard) |
+| `--stale-after 1800` | How long a silent claim is left alone before it's retried |
 | `--max-retries 3` | Attempts before a task is marked failed |
 | `--timeout 3600` | Per-task wall clock |
 | `--claude-arg` | Passed through, repeatable: `--claude-arg --model --claude-arg opus` |

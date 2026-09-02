@@ -74,6 +74,13 @@ will fail; "fix the off-by-one in axi_fifo.sv line 214" will not.
 nothing about task 1. `--chain` threads them together at the cost of a poisoned
 early session infecting the rest.
 
+**Queue it anywhere, and something will run it.** `bq` and `/buffer` write to
+the same locked queue, and both make sure a daemon exists before they return -
+a queued task with no runner is the one outcome this is all meant to prevent.
+Claims carry an owner and a heartbeat, so a `[~]` tells you *what* holds a task
+and when it last checked in; one that goes silent is picked up by whoever is
+still running.
+
 **A task the limit cut in half resumes its own chat.** The daemon records the
 session and reopens it after the reset, so the task continues rather than
 starting over. The id is stored on the task in `queue.md`, so this holds even
