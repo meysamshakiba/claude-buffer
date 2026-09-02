@@ -44,7 +44,7 @@ when you're locked out. Build the habit on `bq`.
 Python 3.10+. No dependencies. Linux, macOS, Windows.
 
 ```bash
-git clone https://github.com/USER/REPO.git buffer && cd buffer
+git clone https://github.com/meysamshakiba/claude-buffer.git buffer && cd buffer
 ```
 
 Then follow [INSTALL.md](INSTALL.md) from step 1's second block onward — the
@@ -78,3 +78,7 @@ running `--dangerously-skip-permissions` will do anything the queue contains.
 
 **Queued work gets the same judgment as typed work.** Nobody is watching, which
 raises the bar rather than lowering it — irreversible steps still wait for you.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
