@@ -446,10 +446,14 @@ def ingest_inbox(path: Path, settle: float = INBOX_SETTLE) -> int:
             log(f"Inbox: cannot read {item.name}: {exc}")
             continue
 
-        cwd = None
+        # Without a header, fall back to home rather than inheriting the
+        # daemon's directory: started from Task Scheduler that is system32, and
+        # an unattended session should not be pointed there. Explicit beats
+        # "wherever this process happened to be launched".
+        cwd = str(Path.home())
         if raw.lower().startswith("cwd:"):
             head, _, rest = raw.partition("\n")
-            cwd = head[4:].strip() or None
+            cwd = head[4:].strip() or cwd
             raw = rest.strip()
 
         if not raw:

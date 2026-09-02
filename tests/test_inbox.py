@@ -7,6 +7,7 @@ daemon reads a directory instead: anything that can write a file can queue work.
 """
 
 import time
+from pathlib import Path
 
 import drain
 import pytest
@@ -68,6 +69,19 @@ def test_a_file_still_being_written_is_left_alone(qpath, inbox):
 
     # once it has settled it goes through
     assert drain.ingest_inbox(qpath, settle=0) == 1
+
+
+def test_without_a_header_it_runs_in_home_not_the_daemons_directory(
+    qpath, inbox, tmp_path, monkeypatch
+):
+    """Launched from Task Scheduler the daemon's cwd is system32. Inheriting it
+    would point unattended sessions at a system directory."""
+    monkeypatch.chdir(tmp_path)
+    drop(inbox, "idea.txt", "no header here")
+    drain.ingest_inbox(qpath)
+    (task,) = tasks(qpath)
+    assert task["cwd"] == str(Path.home())
+    assert task["cwd"] != str(tmp_path)
 
 
 def test_a_cwd_header_says_where_it_runs(qpath, inbox):
