@@ -154,3 +154,62 @@ def test_concurrent_claims_never_hand_out_the_same_task(qpath):
 
     assert len(set(ids)) == n, f"a task was claimed twice: {ids}"
     assert all(t["status"] == "running" for t in read(qpath))
+
+
+# -- CLI mutations report missing IDs -------------------------------------
+
+
+def test_mutating_commands_on_unknown_id_exit_nonzero_and_report_id(qpath):
+    add(qpath, "sample task")
+
+    for cmd in ["done", "fail", "requeue", "remove"]:
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPT), "--file", str(qpath), cmd, "deadbeef"],
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode != 0
+        assert "deadbeef" in proc.stderr
+        assert "no such task" in proc.stderr
+
+
+def test_mutating_commands_on_known_id_succeed(qpath):
+    (task,) = add(qpath, "sample task")
+    tid = task["id"]
+
+    # requeue
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), "--file", str(qpath), "requeue", tid],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0
+    assert tid in proc.stdout
+
+    # fail
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), "--file", str(qpath), "fail", tid, "--note", "oops"],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0
+    assert tid in proc.stdout
+
+    # done
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), "--file", str(qpath), "done", tid],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0
+    assert tid in proc.stdout
+
+    # remove
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), "--file", str(qpath), "--json", "remove", tid],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0
+    assert json.loads(proc.stdout) == {"removed": True}
+
