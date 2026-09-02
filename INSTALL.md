@@ -182,14 +182,18 @@ This costs money per token — that's the trade. Without the flag it just waits.
 | `--stale-after 1800` | How long a silent claim is left alone before it's retried |
 | `--max-retries 3` | Attempts before a task is marked failed |
 | `--timeout 3600` | Per-task wall clock |
-| `--claude-arg` | Passed through, repeatable: `--claude-arg --model --claude-arg opus` |
+| `--` | Everything after it goes to the CLI: `-- --model opus --allowedTools Read,Edit` |
 
 Scope permissions per task rather than globally. An unattended overnight queue
 running `--dangerously-skip-permissions` will do anything the queue contains:
 
 ```bash
---claude-arg --allowedTools --claude-arg "Read,Edit,Bash(vivado *)"
+python3 drain.py --daemon --watch -- --allowedTools "Read,Edit,Bash(vivado *)"
 ```
+
+Everything after `--` goes straight to the CLI. `--claude-arg` takes a single
+value and needs `--claude-arg=--flag` for anything starting with a dash, so `--`
+is usually what you want.
 
 ## 7. Windows notes
 

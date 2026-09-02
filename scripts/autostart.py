@@ -40,8 +40,10 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
 # -- Windows: Task Scheduler ----------------------------------------------
 
 
-def win_install() -> int:
+def win_install(extra: list[str] | None = None) -> int:
     action = f'"{sys.executable}" "{DRAIN}" --daemon --watch'
+    if extra:
+        action += " " + " ".join(f'"{a}"' if " " in a else a for a in extra)
     # Every N minutes rather than at-logon only: it covers logon anyway, and
     # also brings the daemon back if it is killed mid-session. Runs only while
     # logged on, which is what we want — it uses the user's own credentials.
@@ -145,12 +147,18 @@ def main() -> int:
     g.add_argument("--install", action="store_true")
     g.add_argument("--uninstall", action="store_true")
     g.add_argument("--status", action="store_true")
+    p.add_argument("extra", nargs=argparse.REMAINDER,
+                   help="after --, flags passed through to drain.py, e.g. "
+                        "-- --claude-arg --allowedTools --claude-arg Read,Edit")
     args = p.parse_args()
+
+    # argparse.REMAINDER keeps the "--" separator; drain.py should not see it.
+    extra = [a for a in args.extra if a != "--"]
 
     if not IS_WIN:
         return posix_help()
     if args.install:
-        return win_install()
+        return win_install(extra)
     if args.uninstall:
         return win_uninstall()
     return win_status()

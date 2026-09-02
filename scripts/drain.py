@@ -601,13 +601,23 @@ def main() -> int:
     p.add_argument("--fallback-api-key", action="store_true",
                    help="on a usage limit, retry via $BUFFER_FALLBACK_API_KEY "
                         "(metered separately from the subscription) instead of sleeping")
+    # --claude-arg --allowedTools looks natural and argparse rejects it: a value
+    # beginning with "-" reads as another option, and the parser exits 2. Since
+    # nearly everything worth forwarding is a flag, "--" is the usable form and
+    # --claude-arg stays for single values (and needs = for flags).
     p.add_argument("--claude-arg", action="append", default=[],
-                   help="extra flag passed to the CLI (repeatable)")
+                   help="one extra CLI argument, repeatable. For flags use "
+                        "--claude-arg=--allowedTools, or prefer -- below")
+    p.add_argument("cli_args", nargs=argparse.REMAINDER,
+                   help="everything after -- is passed straight to the CLI, "
+                        "e.g. -- --allowedTools Read,Edit")
     p.add_argument("--daemon", action="store_true", help="detach and run in the background")
     p.add_argument("--stop", action="store_true", help="stop the running daemon")
     p.add_argument("--status", action="store_true", help="is a daemon running?")
     p.add_argument("--tail", type=int, nargs="?", const=30, help="show last N daemon log lines")
     args = p.parse_args()
+    # REMAINDER keeps the "--" itself; the CLI must not see it.
+    args.claude_arg = args.claude_arg + [a for a in args.cli_args if a != "--"]
 
     if args.stop:
         return stop_daemon()

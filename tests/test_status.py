@@ -6,9 +6,33 @@ ambiguity reads as a broken tool at precisely the moment the tool is working,
 so the state has to be legible without reading the log.
 """
 
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 import drain
+
+DRAIN = Path(__file__).resolve().parent.parent / "scripts" / "drain.py"
+
+
+def run_cli(*extra):
+    return subprocess.run(
+        [sys.executable, str(DRAIN), "--status", *extra],
+        capture_output=True, text=True,
+    )
+
+
+def test_flags_can_be_forwarded_to_the_cli_after_a_double_dash():
+    """`--claude-arg --allowedTools` exits 2: argparse reads a value starting
+    with "-" as another option. Since almost everything worth forwarding is a
+    flag, "--" has to work, or permission scoping is unusable."""
+    proc = run_cli("--", "--allowedTools", "Read,Edit")
+    assert proc.returncode != 2, proc.stderr
+
+
+def test_a_single_flag_value_still_works_with_equals():
+    assert run_cli("--claude-arg=--allowedTools").returncode != 2
 
 
 def test_sleeping_says_when_it_wakes_and_what_resumes():
