@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Durable FIFO task queue backed by a human-editable markdown file.
 
-Line format (one task per line):
+Line format (one task per line), with an optional percent-encoded note:
     - [ ] id=a1b2c3d4 ts=2026-08-30T14:03:11Z | do task1
+    - [!] id=b2c3d4e5 ts=2026-08-30T14:05:02Z note=timed%20out | do task2
+
+Everything after "| " is task text, verbatim to end of line.
 
 Status markers:
     [ ]  pending
@@ -26,13 +29,14 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 try:
-    import fcntl                     # POSIX
+    import fcntl  # POSIX
 except ImportError:
     fcntl = None
 try:
-    import msvcrt                    # Windows
+    import msvcrt  # Windows
 except ImportError:
     msvcrt = None
 
@@ -104,12 +108,25 @@ def _replace_with_retry(src: str, dst: Path, attempts: int = 40) -> None:
                 raise
             time.sleep(0.05)
 
-HEADER = "# Buffer queue\n\n"
-
 STATUS_CHARS = {" ": "pending", "~": "running", "x": "done", "!": "failed"}
 CHAR_FOR_STATUS = {v: k for k, v in STATUS_CHARS.items()}
 
+# Format 1 put the note after the text, separated by " # ". Task text is prose
+# and routinely contains "#" ("run make # then check the log", "fix #214"), so
+# the split point was ambiguous and the tail of the task was silently dropped
+# on the way to `claude -p`. Format 2 moves the note into the metadata prefix,
+# percent-encoded, which leaves the text as everything after "| " to
+# end-of-line: unambiguous, and still the part a human would hand-edit.
+#
+# The two are indistinguishable per-line, so the file declares its version.
+FORMAT_MARKER = "<!-- buffer-queue format: 2 -->"
+HEADER = f"# Buffer queue\n\n{FORMAT_MARKER}\n\n"
+
 LINE_RE = re.compile(
+    r"^- \[(?P<mark>[ ~x!])\] id=(?P<id>\w+) ts=(?P<ts>\S+)"
+    r"(?: note=(?P<note>\S*))? \| (?P<text>.*)$"
+)
+LINE_RE_V1 = re.compile(
     r"^- \[(?P<mark>[ ~x!])\] id=(?P<id>\w+) ts=(?P<ts>\S+) \| (?P<text>.*?)(?: # (?P<note>.*))?$"
 )
 
@@ -161,29 +178,37 @@ class Queue:
         return False
 
     def _read(self) -> list[dict]:
+        raw = self.path.read_text(encoding="utf-8")
+        # An unmarked file was written by format 1. Parse it on those terms —
+        # guessing wrong turns a note into task text, or vice versa. The next
+        # save() rewrites the whole file as format 2, so this is a one-time read.
+        v2 = FORMAT_MARKER in raw
+        pattern = LINE_RE if v2 else LINE_RE_V1
+
         tasks = []
-        for line in self.path.read_text(encoding="utf-8").splitlines():
-            m = LINE_RE.match(line.rstrip())
+        for line in raw.splitlines():
+            m = pattern.match(line.rstrip())
             if m:
+                note = m.group("note")
                 tasks.append(
                     {
                         "id": m.group("id"),
                         "status": STATUS_CHARS[m.group("mark")],
                         "ts": m.group("ts"),
                         "text": m.group("text"),
-                        "note": m.group("note"),
+                        "note": unquote(note) if (v2 and note is not None) else note,
                     }
                 )
         return tasks
 
     def _render(self, t: dict) -> str:
-        line = (
+        # quote() with no safe characters keeps the note free of spaces and
+        # "|", so it can't be confused with the text that follows it.
+        note = f" note={quote(t['note'], safe='')}" if t.get("note") else ""
+        return (
             f"- [{CHAR_FOR_STATUS[t['status']]}] id={t['id']} "
-            f"ts={t['ts']} | {t['text']}"
+            f"ts={t['ts']}{note} | {t['text']}"
         )
-        if t.get("note"):
-            line += f" # {t['note']}"
-        return line
 
     def save(self) -> None:
         body = HEADER + "\n".join(self._render(t) for t in self.tasks) + "\n"
