@@ -152,8 +152,12 @@ def main() -> int:
                         "-- --claude-arg --allowedTools --claude-arg Read,Edit")
     args = p.parse_args()
 
-    # argparse.REMAINDER keeps the "--" separator; drain.py should not see it.
-    extra = [a for a in args.extra if a != "--"]
+    # REMAINDER keeps the separator that ended our own options. Drop only that
+    # first one — a later "--" is drain's own passthrough marker and must
+    # survive, or the flags after it arrive as drain options and it exits 2.
+    extra = list(args.extra)
+    if extra and extra[0] == "--":
+        extra = extra[1:]
 
     if not IS_WIN:
         return posix_help()
