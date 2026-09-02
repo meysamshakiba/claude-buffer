@@ -43,11 +43,12 @@ where the `python3` alias usually isn't on PATH — use whichever exists.
 ```bash
 python3 scripts/buffer_queue.py add "do task1"   # append to the back
 python3 scripts/buffer_queue.py list [--all]     # --all includes done/failed
-python3 scripts/buffer_queue.py claim            # mark next pending as running
+python3 scripts/buffer_queue.py claim [--worker W]   # next pending -> running
+python3 scripts/buffer_queue.py heartbeat <id>   # "my claim is still alive"
 python3 scripts/buffer_queue.py done <id>
 python3 scripts/buffer_queue.py fail <id> --note "why"
 python3 scripts/buffer_queue.py requeue <id>     # running/failed -> pending
-python3 scripts/buffer_queue.py reset            # crash recovery
+python3 scripts/buffer_queue.py reset            # requeue abandoned claims only
 python3 scripts/buffer_queue.py remove <id>
 python3 scripts/buffer_queue.py status
 python3 scripts/buffer_queue.py clear [--failed]
@@ -74,13 +75,15 @@ plain markdown with checkboxes — the user can open and hand-edit it.
    user may be queuing five things quickly and won't be around to correct a
    misreading.
 2. Report the position: `Queued at #3. Two ahead of it.`
-3. Check `drain.py --status`. If a daemon is up, stop here — it'll be picked up.
-   Two workers on one queue duplicates work.
-4. If no daemon and the queue has more than one task, or the user has signalled
-   they're leaving, start one: `drain.py --daemon --watch`. Tell them the pid
-   and the log path.
-5. Otherwise, for a single task with the user present, just do it inline (below)
-   — spawning a daemon for one task they're watching is overkill.
+3. **Make sure something will run it.** `drain.py --status`; if no daemon is
+   up, start one with `drain.py --daemon --watch` and say the pid and the log
+   path. This does not depend on how many tasks there are or whether the user
+   is watching. A queued task with no runner is the one outcome the whole tool
+   exists to prevent, and the moment you most need a daemon — a usage limit —
+   is the moment you can no longer start one.
+4. Don't drain inline while a daemon is up; it will take the task. If the user
+   wants to watch the work happen here, `drain.py --stop` first, drain inline,
+   then start the daemon again when you're done.
 
 **`/buffer` with no task** — show `list` and daemon status, then offer to drain.
 
@@ -91,9 +94,14 @@ plain markdown with checkboxes — the user can open and hand-edit it.
 
 Work strictly in queue order, one task at a time:
 
-1. `reset` first, to recover anything a previous crash left as running.
-2. `claim` the next task.
-3. Do the task — normally, with full tool access. It's a real request.
+1. `reset` first. It only requeues claims that stopped heartbeating, so it is
+   safe on a shared queue — but never pass `--force`, which takes back every
+   running task including ones another worker is in the middle of.
+2. `claim --worker claude-<session>` the next task, so the `[~]` says who holds
+   it. An unowned `[~]` is indistinguishable from a dead worker's leftovers.
+3. Do the task — normally, with full tool access. It's a real request. On a
+   long one, `heartbeat <id>` as you go, or the daemon will conclude you died
+   and run it again alongside you.
 4. `done` it, or `fail` it with a one-line reason.
 5. Repeat until `claim` returns nothing.
 

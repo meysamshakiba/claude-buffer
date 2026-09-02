@@ -113,13 +113,15 @@ def test_claim_is_fifo(qpath):
         assert q.claim()["text"] == "two"
 
 
-def test_reset_running_requeues_only_running(qpath):
+def test_reset_running_touches_only_running(qpath):
+    """force=True to isolate the status filter from the staleness rule, which
+    has its own tests — a claim this fresh is deliberately left alone."""
     tasks = add(qpath, "one", "two", "three")
     with Queue(qpath) as q:
         q.claim()
         q.set_status(tasks[2]["id"], "done")
     with Queue(qpath) as q:
-        assert q.reset_running() == 1
+        assert q.reset_running(force=True) == 1
     statuses = [t["status"] for t in read(qpath)]
     assert statuses == ["pending", "pending", "done"]
 

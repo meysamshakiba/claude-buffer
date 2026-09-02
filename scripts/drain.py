@@ -19,6 +19,7 @@ its position and is retried first after the reset — nothing jumps the line.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import io
 import json
@@ -27,12 +28,20 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from buffer_queue import Queue, QueueLocked, queue_path, setup_console  # noqa: E402
+from buffer_queue import (
+    STALE_AFTER,
+    Queue,
+    QueueLocked,
+    default_worker,
+    queue_path,
+    setup_console,
+)  # noqa: E402
 
 IS_WIN = os.name == "nt"
 
@@ -80,6 +89,8 @@ RESUME_FAILED_RE = re.compile(
 # A limit doesn't count against a task's retries, so a task misread as limited
 # would retry forever. Bound it: past this many, treat it as a real failure.
 MAX_LIMIT_HITS = 5
+HEARTBEAT_EVERY = 300              # well inside STALE_AFTER, cheap to write
+WORKER_ID = f"drain-{default_worker()}"
 
 
 def state_dir() -> Path:
@@ -337,6 +348,29 @@ def run_task(text: str, cli: str, extra: list[str], timeout: int,
     return proc.returncode == 0, combined, session_id, harness
 
 
+@contextlib.contextmanager
+def heartbeating(path: Path, tid: str, worker: str):
+    """Keep saying the claim is alive while a task runs.
+
+    A task may legitimately run for --timeout, which is longer than the window
+    after which another worker treats a claim as abandoned. Without this beat,
+    a healthy long task would eventually be reclaimed and run twice.
+    """
+    stop = threading.Event()
+
+    def beat():
+        while not stop.wait(HEARTBEAT_EVERY):
+            queue_op(path, lambda q: q.heartbeat(tid, worker))
+
+    thread = threading.Thread(target=beat, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+
+
 def queue_op(path: Path, fn, retries: int = 3):
     """Run one queue mutation, tolerating a busy lock. The daemon must not die
     because `bq` happened to hold the queue at the wrong moment."""
@@ -352,21 +386,32 @@ def queue_op(path: Path, fn, retries: int = 3):
 
 
 def drain(args, path: Path) -> int:
-    n = queue_op(path, lambda q: q.reset_running())
+    # Only claims nobody is maintaining. The queue is shared with `bq` and with
+    # any Claude session draining inline, so a blanket requeue here would drag
+    # someone else's in-flight task back to pending underneath them.
+    stale = args.stale_after
+    n = queue_op(path, lambda q: q.reset_running(stale))
     if n:
-        log(f"Requeued {n} interrupted task(s).")
+        log(f"Requeued {n} abandoned task(s) (no heartbeat for {stale / 60:.0f}m).")
 
     attempts: dict[str, int] = {}
     limit_hits: dict[str, int] = {}
     chain_session: str | None = None
 
     while True:
-        task = queue_op(path, lambda q: q.claim())
+        task = queue_op(path, lambda q: q.claim(WORKER_ID))
 
         if task is None:
             if not args.watch:
                 log("Queue empty. Done.")
                 return 0
+            # Idle is the right moment to notice that another worker died
+            # holding a task: nothing pending means nothing else to do, and
+            # otherwise an abandoned claim would sit there until a restart.
+            recovered = queue_op(path, lambda q: q.reset_running(stale))
+            if recovered:
+                log(f"Recovered {recovered} abandoned task(s) from another worker.")
+                continue
             time.sleep(args.poll)
             continue
 
@@ -384,9 +429,10 @@ def drain(args, path: Path) -> int:
             log(f"Running [{tid}] {text}")
             resume_sid = chain_session if args.chain else None
 
-        ok, output, session_id, harness = run_task(
-            prompt, args.cli, args.claude_arg, args.timeout, resume_sid,
-        )
+        with heartbeating(path, tid, WORKER_ID):
+            ok, output, session_id, harness = run_task(
+                prompt, args.cli, args.claude_arg, args.timeout, resume_sid,
+            )
         reset_epoch, kind = detect_limit(output, failed=not ok, harness_text=harness)
 
         # Don't let a conversation the CLI won't reopen strand the task; drop it
@@ -423,11 +469,12 @@ def drain(args, path: Path) -> int:
             # keep working on metered billing instead of sleeping.
             if args.fallback_api_key and os.environ.get("BUFFER_FALLBACK_API_KEY"):
                 log(f"{kind} limit hit — retrying [{tid}] on API-key billing.")
-                ok, output, session_id, harness = run_task(
-                    RESUME_PROMPT.format(text=text) if interrupted else text,
-                    args.cli, args.claude_arg, args.timeout,
-                    interrupted, use_api_key=True,
-                )
+                with heartbeating(path, tid, WORKER_ID):
+                    ok, output, session_id, harness = run_task(
+                        RESUME_PROMPT.format(text=text) if interrupted else text,
+                        args.cli, args.claude_arg, args.timeout,
+                        interrupted, use_api_key=True,
+                    )
                 if ok:
                     if args.chain and session_id:
                         chain_session = session_id
@@ -477,6 +524,9 @@ def main() -> int:
     p.add_argument("--max-retries", type=int, default=3, help="attempts per task before failing")
     p.add_argument("--max-sleep", type=int, default=DEFAULT_MAX_SLEEP,
                    help="refuse to wait longer than this many seconds (weekly-limit guard)")
+    p.add_argument("--stale-after", type=float, default=STALE_AFTER,
+                   help="seconds without a heartbeat before another worker's "
+                        "claim counts as abandoned and is retried")
     p.add_argument("--chain", action="store_true",
                    help="thread tasks into one session so later tasks see earlier context")
     p.add_argument("--fallback-api-key", action="store_true",

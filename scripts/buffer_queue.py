@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import re
 import secrets
 import sys
@@ -128,11 +129,24 @@ HEADER = f"# Buffer queue\n\n{FORMAT_MARKER}\n\n"
 
 LINE_RE = re.compile(
     r"^- \[(?P<mark>[ ~x!])\] id=(?P<id>\w+) ts=(?P<ts>\S+)"
-    r"(?: note=(?P<note>\S*))?(?: session=(?P<session>\S*))? \| (?P<text>.*)$"
+    r"(?: note=(?P<note>\S*))?(?: session=(?P<session>\S*))?"
+    r"(?: worker=(?P<worker>\S*))?(?: hb=(?P<hb>\d+))? \| (?P<text>.*)$"
 )
 LINE_RE_V1 = re.compile(
     r"^- \[(?P<mark>[ ~x!])\] id=(?P<id>\w+) ts=(?P<ts>\S+) \| (?P<text>.*?)(?: # (?P<note>.*))?$"
 )
+
+
+# How long a claim may go without a heartbeat before another worker may take
+# it. Generous on purpose: stealing a task that is merely slow is worse than
+# leaving a dead one parked for a while, since the queue keeps moving either way.
+STALE_AFTER = 30 * 60
+
+
+def default_worker() -> str:
+    """Who holds a claim. Host and pid is enough to tell 'someone else, still
+    alive' from 'me' and from 'a process that no longer exists'."""
+    return f"{platform.node() or 'unknown'}:{os.getpid()}"
 
 
 def queue_path() -> Path:
@@ -195,6 +209,8 @@ class Queue:
             if m:
                 note = m.group("note")
                 session = m.group("session") if v2 else None
+                worker = m.group("worker") if v2 else None
+                hb = m.group("hb") if v2 else None
                 tasks.append(
                     {
                         "id": m.group("id"),
@@ -203,6 +219,8 @@ class Queue:
                         "text": m.group("text"),
                         "note": unquote(note) if (v2 and note is not None) else note,
                         "session": unquote(session) if session else None,
+                        "worker": unquote(worker) if worker else None,
+                        "hb": int(hb) if hb else None,
                     }
                 )
         return tasks
@@ -212,9 +230,11 @@ class Queue:
         # "|", so it can't be confused with the text that follows it.
         note = f" note={quote(t['note'], safe='')}" if t.get("note") else ""
         session = f" session={quote(t['session'], safe='')}" if t.get("session") else ""
+        worker = f" worker={quote(t['worker'], safe='')}" if t.get("worker") else ""
+        hb = f" hb={t['hb']}" if t.get("hb") else ""
         return (
             f"- [{CHAR_FOR_STATUS[t['status']]}] id={t['id']} "
-            f"ts={t['ts']}{note}{session} | {t['text']}"
+            f"ts={t['ts']}{note}{session}{worker}{hb} | {t['text']}"
         )
 
     def save(self) -> None:
@@ -240,6 +260,8 @@ class Queue:
             "text": text.strip().replace("\n", " "),
             "note": None,
             "session": None,
+            "worker": None,
+            "hb": None,
         }
         self.tasks.append(task)
         self.save()
@@ -263,12 +285,35 @@ class Queue:
         """Oldest pending task. Order is file order, which is insertion order."""
         return next((t for t in self.tasks if t["status"] == "pending"), None)
 
-    def claim(self) -> dict | None:
+    def claim(self, worker: str | None = None) -> dict | None:
         task = self.peek()
         if task:
             task["status"] = "running"
+            task["worker"] = worker or default_worker()
+            task["hb"] = int(time.time())
             self.save()
         return task
+
+    def heartbeat(self, task_id: str, worker: str | None = None) -> dict | None:
+        """Say the claim is still alive. Without this a claim is just a mark in
+        a file: indistinguishable from one left behind by a worker that died,
+        which is what makes a blind reset dangerous."""
+        task = self.find(task_id)
+        if not task or task["status"] != "running":
+            return None  # nothing to keep alive; don't report success
+        task["hb"] = int(time.time())
+        if worker:
+            task["worker"] = worker
+        self.save()
+        return task
+
+    def stale_running(self, stale_after: float) -> list[dict]:
+        """Running tasks whose owner has stopped saying it is alive."""
+        cutoff = time.time() - stale_after
+        return [
+            t for t in self.tasks
+            if t["status"] == "running" and (not t.get("hb") or int(t["hb"]) < cutoff)
+        ]
 
     def set_status(self, task_id: str, status: str, note: str | None = None) -> dict | None:
         task = self.find(task_id)
@@ -276,16 +321,32 @@ class Queue:
             task["status"] = status
             if note is not None:
                 task["note"] = note.replace("\n", " ")
+            if status != "running":
+                # The claim is over; leaving an owner on it would make a
+                # finished or requeued task look like someone's in-flight work.
+                task["worker"] = None
+                task["hb"] = None
             self.save()
         return task
 
-    def reset_running(self) -> int:
-        """Return interrupted tasks to pending. Run this at worker startup:
-        a killed worker leaves [~] behind and nothing would pick it up."""
+    def reset_running(self, stale_after: float | None = STALE_AFTER,
+                      force: bool = False) -> int:
+        """Return abandoned tasks to pending.
+
+        A worker that dies leaves [~] behind and nothing would pick the task up
+        again — hence this. But the queue is shared, so "[~]" on its own does
+        not mean "abandoned"; it may be someone else's task, in flight right
+        now. Only claims that have stopped heartbeating are reclaimed. Pass
+        force to take everything back regardless, which is only correct when
+        you know you are the sole worker.
+        """
+        doomed = self.tasks if force else self.stale_running(stale_after)
         n = 0
-        for t in self.tasks:
+        for t in doomed:
             if t["status"] == "running":
                 t["status"] = "pending"
+                t["worker"] = None
+                t["hb"] = None
                 n += 1
         if n:
             self.save()
@@ -336,8 +397,22 @@ def main() -> int:
     a.add_argument("text", nargs="+")
 
     sub.add_parser("peek", help="show next pending task without claiming it")
-    sub.add_parser("claim", help="mark next pending task as running and print it")
-    sub.add_parser("reset", help="return running tasks to pending (crash recovery)")
+
+    c = sub.add_parser("claim", help="mark next pending task as running and print it")
+    c.add_argument("--worker", help="who is claiming it (default: host:pid)")
+
+    hb = sub.add_parser("heartbeat", help="report that a claim is still alive")
+    hb.add_argument("id")
+    hb.add_argument("--worker")
+
+    rs = sub.add_parser("reset", help="return abandoned tasks to pending")
+    rs.add_argument("--force", action="store_true",
+                    help="requeue every running task, not just the stale ones "
+                         "(only correct if you are the sole worker)")
+    rs.add_argument("--stale-after", type=float, default=STALE_AFTER,
+                    help=f"seconds without a heartbeat before a claim counts as "
+                         f"abandoned (default {STALE_AFTER})")
+
     sub.add_parser("status", help="show counts")
 
     d = sub.add_parser("done", help="mark a task complete")
@@ -368,11 +443,18 @@ def main() -> int:
         elif args.cmd == "peek":
             emit(q.peek(), args.json)
         elif args.cmd == "claim":
-            t = q.claim()
+            t = q.claim(args.worker)
+            emit(t, args.json)
+            return 0 if t else 1
+        elif args.cmd == "heartbeat":
+            t = q.heartbeat(args.id, args.worker)
             emit(t, args.json)
             return 0 if t else 1
         elif args.cmd == "reset":
-            emit({"requeued": q.reset_running()}, args.json)
+            emit(
+                {"requeued": q.reset_running(args.stale_after, force=args.force)},
+                args.json,
+            )
         elif args.cmd == "done":
             emit(q.set_status(args.id, "done"), args.json)
         elif args.cmd == "fail":
@@ -394,10 +476,21 @@ def main() -> int:
             elif not shown:
                 print("Queue is empty.")
             else:
+                now = int(time.time())
                 for i, t in enumerate(shown, 1):
                     mark = CHAR_FOR_STATUS[t["status"]]
                     note = f"  # {t['note']}" if t.get("note") else ""
-                    print(f"{i:>3}. [{mark}] {t['id']}  {t['text']}{note}")
+                    owner = ""
+                    if t["status"] == "running":
+                        # "[~]" alone can't be told from a dead worker's leftovers.
+                        age = now - int(t["hb"]) if t.get("hb") else None
+                        who = t.get("worker") or "unknown worker"
+                        owner = (
+                            f"  <- {who}, last seen {age // 60}m ago"
+                            if age is not None
+                            else f"  <- {who}, never checked in"
+                        )
+                    print(f"{i:>3}. [{mark}] {t['id']}  {t['text']}{note}{owner}")
         elif args.cmd == "clear":
             statuses = {"done", "failed"} if args.failed else {"done"}
             emit({"removed": q.clear(statuses)}, args.json)
