@@ -295,8 +295,8 @@ def sleep_until(epoch: int, kind: str, max_sleep: int, pad: int = 60) -> bool:
 
 
 def run_task(text: str, cli: str, extra: list[str], timeout: int,
-             resume: str | None,
-             use_api_key: bool = False) -> tuple[bool, str, str | None, str]:
+             resume: str | None, use_api_key: bool = False,
+             cwd: str | None = None) -> tuple[bool, str, str | None, str]:
     """Run one task. Returns (ok, combined_output, session_id, harness_output).
 
     harness_output is the subset of the output the CLI itself produced —
@@ -317,10 +317,17 @@ def run_task(text: str, cli: str, extra: list[str], timeout: int,
     if use_api_key:
         env["ANTHROPIC_API_KEY"] = os.environ["BUFFER_FALLBACK_API_KEY"]
 
+    # The task was queued from a particular project; the daemon may have been
+    # started at logon from somewhere else entirely. Run it where it belongs,
+    # but don't fail outright if that directory has since moved.
+    if cwd and not Path(cwd).is_dir():
+        log(f"Directory {cwd} no longer exists; running in {os.getcwd()} instead.")
+        cwd = None
+
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout,
-            encoding="utf-8", errors="replace", env=env,
+            encoding="utf-8", errors="replace", env=env, cwd=cwd,
         )
     except FileNotFoundError:
         msg = f"`{cli}` not found on PATH"
@@ -422,16 +429,19 @@ def drain(args, path: Path) -> int:
         # the task. Resuming it means the retry continues the same chat with the
         # work already done still in view, rather than starting the task over.
         resume_sid = task.get("session")
+        task_cwd = task.get("cwd")
         prompt = RESUME_PROMPT.format(text=text) if resume_sid else text
+        where = f" in {task_cwd}" if task_cwd else ""
         if resume_sid:
-            log(f"Resuming [{tid}] in session {resume_sid}")
+            log(f"Resuming [{tid}] in session {resume_sid}{where}")
         else:
-            log(f"Running [{tid}] {text}")
+            log(f"Running [{tid}]{where} {text}")
             resume_sid = chain_session if args.chain else None
 
         with heartbeating(path, tid, WORKER_ID):
             ok, output, session_id, harness = run_task(
                 prompt, args.cli, args.claude_arg, args.timeout, resume_sid,
+                cwd=task_cwd,
             )
         reset_epoch, kind = detect_limit(output, failed=not ok, harness_text=harness)
 
@@ -473,7 +483,7 @@ def drain(args, path: Path) -> int:
                     ok, output, session_id, harness = run_task(
                         RESUME_PROMPT.format(text=text) if interrupted else text,
                         args.cli, args.claude_arg, args.timeout,
-                        interrupted, use_api_key=True,
+                        interrupted, use_api_key=True, cwd=task_cwd,
                     )
                 if ok:
                     if args.chain and session_id:

@@ -6,11 +6,13 @@ REM   bq "fix the off-by-one in axi_fifo.sv line 214"
 REM   bq            show queue + daemon status
 REM   bq log [N]    tail the daemon log
 REM   bq stop
+REM   bq autostart  keep a daemon running from now on
 setlocal
 if "%BUFFER_SKILL_DIR%"=="" set "BUFFER_SKILL_DIR=%USERPROFILE%\.claude\skills\buffer"
 if "%PYTHON%"=="" set "PYTHON=python"
 set "Q=%BUFFER_SKILL_DIR%\scripts\buffer_queue.py"
 set "D=%BUFFER_SKILL_DIR%\scripts\drain.py"
+set "A=%BUFFER_SKILL_DIR%\scripts\autostart.py"
 
 if "%~1"=="" (
   "%PYTHON%" "%Q%" list
@@ -30,6 +32,12 @@ if "%~1"=="stop" (
 if "%~1"=="status" (
   "%PYTHON%" "%Q%" status
   "%PYTHON%" "%D%" --status
+  exit /b %ERRORLEVEL%
+)
+if "%~1"=="autostart" (
+  set "SUB=%~2"
+  if "%~2"=="" set "SUB=install"
+  call "%PYTHON%" "%A%" --%%SUB%%
   exit /b %ERRORLEVEL%
 )
 

@@ -122,7 +122,34 @@ State lives together, in `~/.claude/buffer/` — on Windows,
 Override with `CLAUDE_BUFFER_QUEUE`. For a per-project queue, set it to
 `.claude/buffer/queue.md` and install the skill under the repo's `.claude/`.
 
-## 4. Don't wait at all (optional)
+## 4. Make it automatic
+
+The daemon survives a terminal closing, a session ending and a usage limit. It
+does not survive a reboot, and nothing notices if it dies -- which defeats the
+point, since you are not watching.
+
+```bash
+bq autostart            # register it; also starts one now
+bq autostart status
+bq autostart uninstall
+```
+
+On Windows this registers a Task Scheduler entry that runs `drain.py --daemon`
+every 15 minutes. That command does nothing when a daemon is already up, so it
+is a cheap supervisor rather than a second worker: it covers logon, and it
+brings the daemon back if it is ever killed. It runs only while you are logged
+on, because it uses your own Claude credentials.
+
+Elsewhere `bq autostart` prints a systemd user timer and a launchd plist to
+paste; the same reasoning applies to both.
+
+**Tasks remember where they were queued.** `bq "fix the failing test"` records
+your current directory and the daemon runs that task there, so one daemon
+started anywhere serves every project. A task queued before this existed, or
+from a directory since deleted, runs wherever the daemon is -- with a line in
+the log saying so.
+
+## 5. Don't wait at all (optional)
 
 API billing is metered separately from your subscription, so a locked-out
 subscription doesn't block an API key:
@@ -145,7 +172,7 @@ effect on a daemon that's already running.
 On a usage limit the daemon retries the task on the API key instead of sleeping.
 This costs money per token — that's the trade. Without the flag it just waits.
 
-## 5. Flags
+## 6. Flags
 
 | Flag | Why |
 |---|---|
@@ -164,7 +191,7 @@ running `--dangerously-skip-permissions` will do anything the queue contains:
 --claude-arg --allowedTools --claude-arg "Read,Edit,Bash(vivado *)"
 ```
 
-## 6. Windows notes
+## 7. Windows notes
 
 Supported natively. You install `bin\bq.cmd` rather than `bin/bq`, but you
 still *type* `bq` — PowerShell and cmd resolve it through `PATHEXT`.

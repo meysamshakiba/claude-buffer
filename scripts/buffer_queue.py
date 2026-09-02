@@ -130,7 +130,8 @@ HEADER = f"# Buffer queue\n\n{FORMAT_MARKER}\n\n"
 LINE_RE = re.compile(
     r"^- \[(?P<mark>[ ~x!])\] id=(?P<id>\w+) ts=(?P<ts>\S+)"
     r"(?: note=(?P<note>\S*))?(?: session=(?P<session>\S*))?"
-    r"(?: worker=(?P<worker>\S*))?(?: hb=(?P<hb>\d+))? \| (?P<text>.*)$"
+    r"(?: worker=(?P<worker>\S*))?(?: hb=(?P<hb>\d+))?"
+    r"(?: cwd=(?P<cwd>\S*))? \| (?P<text>.*)$"
 )
 LINE_RE_V1 = re.compile(
     r"^- \[(?P<mark>[ ~x!])\] id=(?P<id>\w+) ts=(?P<ts>\S+) \| (?P<text>.*?)(?: # (?P<note>.*))?$"
@@ -211,6 +212,7 @@ class Queue:
                 session = m.group("session") if v2 else None
                 worker = m.group("worker") if v2 else None
                 hb = m.group("hb") if v2 else None
+                cwd = m.group("cwd") if v2 else None
                 tasks.append(
                     {
                         "id": m.group("id"),
@@ -221,6 +223,7 @@ class Queue:
                         "session": unquote(session) if session else None,
                         "worker": unquote(worker) if worker else None,
                         "hb": int(hb) if hb else None,
+                        "cwd": unquote(cwd) if cwd else None,
                     }
                 )
         return tasks
@@ -232,9 +235,10 @@ class Queue:
         session = f" session={quote(t['session'], safe='')}" if t.get("session") else ""
         worker = f" worker={quote(t['worker'], safe='')}" if t.get("worker") else ""
         hb = f" hb={t['hb']}" if t.get("hb") else ""
+        cwd = f" cwd={quote(t['cwd'], safe='')}" if t.get("cwd") else ""
         return (
             f"- [{CHAR_FOR_STATUS[t['status']]}] id={t['id']} "
-            f"ts={t['ts']}{note}{session}{worker}{hb} | {t['text']}"
+            f"ts={t['ts']}{note}{session}{worker}{hb}{cwd} | {t['text']}"
         )
 
     def save(self) -> None:
@@ -252,7 +256,11 @@ class Queue:
 
     # -- operations -------------------------------------------------
 
-    def add(self, text: str) -> dict:
+    def add(self, text: str, cwd: str | None = None) -> dict:
+        """Records where it was queued from. A task is nearly always about the
+        project you are standing in, and the worker that eventually runs it may
+        be a background process that was started somewhere else entirely —
+        without this, "fix the failing test" runs in the wrong repo."""
         task = {
             "id": secrets.token_hex(4),
             "status": "pending",
@@ -262,6 +270,7 @@ class Queue:
             "session": None,
             "worker": None,
             "hb": None,
+            "cwd": cwd or os.getcwd(),
         }
         self.tasks.append(task)
         self.save()
@@ -395,6 +404,7 @@ def main() -> int:
 
     a = sub.add_parser("add", help="append a task to the back of the queue")
     a.add_argument("text", nargs="+")
+    a.add_argument("--cwd", help="directory to run it in (default: where you are)")
 
     sub.add_parser("peek", help="show next pending task without claiming it")
 
@@ -439,7 +449,7 @@ def main() -> int:
 
     with Queue(path) as q:
         if args.cmd == "add":
-            emit(q.add(" ".join(args.text)), args.json)
+            emit(q.add(" ".join(args.text), args.cwd), args.json)
         elif args.cmd == "peek":
             emit(q.peek(), args.json)
         elif args.cmd == "claim":

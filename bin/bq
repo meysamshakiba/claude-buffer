@@ -6,6 +6,7 @@
 #   bq            # show queue + daemon status
 #   bq log        # tail the daemon log
 #   bq stop
+#   bq autostart  # keep a daemon running from now on
 set -euo pipefail
 SKILL="${BUFFER_SKILL_DIR:-$HOME/.claude/skills/buffer}"
 PY="${PYTHON:-python3}"
@@ -17,6 +18,7 @@ case "${1:-}" in
   stop)   "$PY" "$SKILL/scripts/drain.py" --stop ;;
   status) "$PY" "$SKILL/scripts/buffer_queue.py" status
           "$PY" "$SKILL/scripts/drain.py" --status ;;
+  autostart) "$PY" "$SKILL/scripts/autostart.py" "--${2:-install}" ;;
   *)      "$PY" "$SKILL/scripts/buffer_queue.py" add "$*"
           # Make sure something will actually run it.
           "$PY" "$SKILL/scripts/drain.py" --status >/dev/null 2>&1 \

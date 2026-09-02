@@ -24,9 +24,11 @@ class FakeCLI:
         self.script = list(script)
         self.calls = []
 
-    def __call__(self, text, cli, extra, timeout, resume, use_api_key=False):
+    def __call__(self, text, cli, extra, timeout, resume, use_api_key=False, cwd=None):
         step = self.script.pop(0) if self.script else {"mode": "ok"}
-        self.calls.append({"text": text, "resume": resume, "api": use_api_key})
+        self.calls.append(
+            {"text": text, "resume": resume, "api": use_api_key, "cwd": cwd}
+        )
         sid = step.get("sid", "sess-1")
         mode = step["mode"]
         if mode == "limit":

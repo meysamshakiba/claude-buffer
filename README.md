@@ -74,6 +74,12 @@ will fail; "fix the off-by-one in axi_fifo.sv line 214" will not.
 nothing about task 1. `--chain` threads them together at the cost of a poisoned
 early session infecting the rest.
 
+**It runs where you queued it.** Each task records the directory it came from,
+so one daemon serves every project and you never tell it a path.
+
+**`bq autostart` keeps a daemon alive** across reboots and crashes, by
+re-running a command that is a no-op when one is already up.
+
 **Queue it anywhere, and something will run it.** `bq` and `/buffer` write to
 the same locked queue, and both make sure a daemon exists before they return -
 a queued task with no runner is the one outcome this is all meant to prevent.
