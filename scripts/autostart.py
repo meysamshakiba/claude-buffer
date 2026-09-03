@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from buffer_queue import setup_console
+from buffer_queue import queue_path, setup_console
 
 TASK_NAME = "ClaudeBufferDaemon"
 EVERY_MINUTES = 15
@@ -40,10 +40,30 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
 # -- Windows: Task Scheduler ----------------------------------------------
 
 
-def win_install(extra: list[str] | None = None) -> int:
-    action = f'"{sys.executable}" "{DRAIN}" --daemon --watch'
+def launcher_path() -> Path:
+    return queue_path().parent / "run-daemon.cmd"
+
+
+def write_launcher(extra: list[str]) -> Path:
+    """schtasks caps /TR at 261 characters, and a useful policy — allowed tools,
+    denied commands, --checkpoint — blows past that immediately. Put the real
+    command in a script and register that instead; it also means the policy can
+    be read and edited without re-registering anything."""
+    cmd = f'"{sys.executable}" "{DRAIN}" --daemon --watch'
     if extra:
-        action += " " + " ".join(f'"{a}"' if " " in a else a for a in extra)
+        cmd += " " + " ".join(f'"{a}"' if " " in a or "," in a else a for a in extra)
+    path = launcher_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "@echo off\r\nREM Written by autostart.py. Edit to change the daemon's\r\n"
+        "REM policy, then re-run the scheduled task.\r\n" + cmd + "\r\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def win_install(extra: list[str] | None = None) -> int:
+    action = f'"{write_launcher(extra or [])}"'
     # Every N minutes rather than at-logon only: it covers logon anyway, and
     # also brings the daemon back if it is killed mid-session. Runs only while
     # logged on, which is what we want — it uses the user's own credentials.
@@ -55,6 +75,7 @@ def win_install(extra: list[str] | None = None) -> int:
         print(proc.stderr.strip() or proc.stdout.strip())
         return proc.returncode
     print(f"Registered scheduled task '{TASK_NAME}' (every {EVERY_MINUTES}m).")
+    print(f"Policy lives in {launcher_path()} — edit it there.")
 
     # The first scheduled run is up to EVERY_MINUTES away; don't make the user
     # wait to find out whether it works.

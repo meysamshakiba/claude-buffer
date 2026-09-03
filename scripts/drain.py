@@ -825,7 +825,18 @@ def main() -> int:
                         "unattended edits is reviewable and revertable")
     args = p.parse_args()
     # REMAINDER keeps the "--" itself; the CLI must not see it.
-    args.claude_arg = args.claude_arg + [a for a in args.cli_args if a != "--"]
+    forwarded = [a for a in args.cli_args if a != "--"]
+
+    # A drain flag written after "--" is silently handed to `claude`, which
+    # rejects it and fails every task. Easy to do and invisible once detached,
+    # so say it out loud rather than letting a night's queue die on it.
+    ours = {s for action in p._actions for s in action.option_strings}
+    strays = [a for a in forwarded if a in ours]
+    if strays:
+        log(f"Warning: {' '.join(strays)} belongs to drain, not the CLI. "
+            f"Put it before the '--'. Passing it on unchanged.")
+
+    args.claude_arg = args.claude_arg + forwarded
 
     if args.stop:
         return stop_daemon()
