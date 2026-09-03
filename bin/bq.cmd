@@ -34,6 +34,12 @@ if "%~1"=="status" (
   "%PYTHON%" "%D%" --status
   exit /b %ERRORLEVEL%
 )
+if "%~1"=="report" (
+  set "H=%~2"
+  if "%~2"=="" set "H=12"
+  call "%PYTHON%" "%D%" --report %%H%%
+  exit /b %ERRORLEVEL%
+)
 if "%~1"=="autostart" (
   set "SUB=%~2"
   if "%~2"=="" set "SUB=install"

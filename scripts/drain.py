@@ -30,7 +30,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -475,6 +475,47 @@ def ingest_inbox(path: Path, settle: float = INBOX_SETTLE) -> int:
     return added
 
 
+# -- git checkpoints -------------------------------------------------------
+#
+# The permission deny-list stops accidents, not determined paths: rm is
+# reachable through `python -c`, `find -delete`, `git clean`. So reversibility
+# cannot rest on it. A commit per task is the thing that actually makes a night
+# of unattended work undoable -- and it turns the morning into "review seven
+# commits" rather than "diff twelve hours of mixed edits".
+
+
+def _git(root, *args) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+
+
+def git_root(cwd: str | None) -> Path | None:
+    if not cwd or not Path(cwd).is_dir():
+        return None
+    proc = _git(cwd, "rev-parse", "--show-toplevel")
+    out = proc.stdout.strip()
+    return Path(out) if proc.returncode == 0 and out else None
+
+
+def git_dirty(root: Path) -> bool:
+    return bool(_git(root, "status", "--porcelain").stdout.strip())
+
+
+def checkpoint(root: Path, message: str) -> str | None:
+    """Commit the working tree. Returns the short sha, or None if there was
+    nothing to commit. Never pushes -- publishing stays the user's call."""
+    if not git_dirty(root):
+        return None
+    _git(root, "add", "-A")
+    proc = _git(root, "commit", "-m", message)
+    if proc.returncode != 0:
+        log(f"Checkpoint failed: {(proc.stderr or proc.stdout).strip()[:200]}")
+        return None
+    return _git(root, "rev-parse", "--short", "HEAD").stdout.strip()
+
+
 @contextlib.contextmanager
 def heartbeating(path: Path, tid: str, worker: str):
     """Keep saying the claim is alive while a task runs.
@@ -563,6 +604,14 @@ def drain(args, path: Path) -> int:
             log(f"Running [{tid}]{where} {text}")
             resume_sid = chain_session if args.chain else None
 
+        # Commit anything already lying around first, so this task's diff is
+        # its own and reverting it doesn't take unrelated work with it.
+        root = git_root(task_cwd) if args.checkpoint else None
+        if root and git_dirty(root):
+            pre = checkpoint(root, f"buffer: uncommitted work found before [{tid}]")
+            if pre:
+                log(f"Checkpointed pre-existing changes as {pre}")
+
         set_state(state="running", task=tid, since=int(time.time()))
         with heartbeating(path, tid, WORKER_ID):
             ok, output, session_id, harness = run_task(
@@ -636,6 +685,18 @@ def drain(args, path: Path) -> int:
                 time.sleep(DEFAULT_BACKOFF)
             continue
 
+        # Commit on failure too: a task that got halfway leaves edits behind,
+        # and they need to be as visible and revertable as a successful one's.
+        if root:
+            outcome = "" if ok else " (task failed)"
+            sha = checkpoint(
+                root,
+                f"buffer[{tid}]: {text[:72]}{outcome}\n\n"
+                f"Queued {task['ts']}, run by the buffer daemon.",
+            )
+            if sha:
+                log(f"Committed {sha} in {root}")
+
         # The task is off the limit path either way now, so the stored session
         # has done its job. Leaving it would resume a finished conversation.
         if task.get("session"):
@@ -654,6 +715,73 @@ def drain(args, path: Path) -> int:
             tail = output.strip().splitlines()[-1] if output.strip() else "no output"
             queue_op(path, lambda q: q.set_status(tid, "failed", tail[:160]))
             log(f"Giving up on [{tid}] after {attempts[tid]} attempts.")
+
+
+def report(path: Path, hours: float) -> int:
+    """What happened while nobody was watching.
+
+    The log is hundreds of lines of Claude prose by morning. What you need is
+    which tasks ran, which need you, and what changed on disk -- with anything
+    destructive called out rather than buried.
+    """
+    with Queue(path) as q:
+        tasks = list(q.tasks)
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    recent = []
+    for t in tasks:
+        try:
+            when = datetime.strptime(t["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            continue
+        if when >= cutoff:
+            recent.append((when, t))
+
+    counts: dict[str, int] = {}
+    for _, t in recent:
+        counts[t["status"]] = counts.get(t["status"], 0) + 1
+    headline = ", ".join(f"{n} {s}" for s, n in sorted(counts.items())) or "nothing"
+    print(f"Last {hours:g}h: {headline}.\n")
+
+    needs_you, warnings = [], []
+    for when, t in recent:
+        mark = {"done": "+", "failed": "!", "pending": ".", "running": "~"}[t["status"]]
+        print(f"{mark} [{t['id']}] {when.astimezone():%H:%M}  {t['text'][:88]}")
+        if t.get("note"):
+            print(f"      note: {t['note'][:100]}")
+        if t["status"] == "failed":
+            needs_you.append(t)
+
+        root = git_root(t.get("cwd"))
+        if not root:
+            continue
+        found = _git(root, "log", "--all", "--format=%h", "--grep",
+                     f"buffer\\[{t['id']}\\]")
+        for sha in found.stdout.split():
+            stat = _git(root, "show", "--stat", "--format=", sha).stdout.strip()
+            for line in stat.splitlines():
+                print(f"      {line.strip()}")
+            names = _git(root, "show", "--name-status", "--format=", sha).stdout
+            deleted = [ln.split("\t")[-1] for ln in names.splitlines()
+                       if ln.startswith("D")]
+            if deleted:
+                warnings.append((t["id"], sha, deleted))
+        print()
+
+    if warnings:
+        print("Worth a look -- files were deleted:")
+        for tid, sha, files in warnings:
+            print(f"  [{tid}] {sha}: {', '.join(files[:6])}")
+        print("  Undo one with: git revert <sha>\n")
+
+    if needs_you:
+        print("Needs you:")
+        for t in needs_you:
+            print(f"  [{t['id']}] {t['text'][:80]}")
+            print(f"      {t.get('note') or 'no reason recorded'}")
+    return 0
 
 
 def main() -> int:
@@ -689,6 +817,12 @@ def main() -> int:
     p.add_argument("--stop", action="store_true", help="stop the running daemon")
     p.add_argument("--status", action="store_true", help="is a daemon running?")
     p.add_argument("--tail", type=int, nargs="?", const=30, help="show last N daemon log lines")
+    p.add_argument("--report", type=float, nargs="?", const=12.0, metavar="HOURS",
+                   help="what ran recently, what changed, what needs you "
+                        "(default: last 12h)")
+    p.add_argument("--checkpoint", action="store_true",
+                   help="commit the working tree after each task, so a night of "
+                        "unattended edits is reviewable and revertable")
     args = p.parse_args()
     # REMAINDER keeps the "--" itself; the CLI must not see it.
     args.claude_arg = args.claude_arg + [a for a in args.cli_args if a != "--"]
@@ -706,6 +840,11 @@ def main() -> int:
         if doing:
             print(f"  {doing}")
         return 0
+
+    if args.report is not None:
+        return report(
+            Path(args.file).expanduser() if args.file else queue_path(), args.report
+        )
 
     if args.tail is not None:
         lf = log_file()

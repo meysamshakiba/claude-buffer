@@ -178,7 +178,31 @@ That makes the transport your choice -- anything that can write a file:
 
 The queue then does what it always did: one at a time, in order, through limits.
 
-## 6. Don't wait at all (optional)
+## 6. Leaving it running overnight
+
+The case this is built for: queue what you already know you want at 8pm, read a
+report at 8am.
+
+```bash
+bq autostart -- -- --checkpoint   --allowedTools "Read,Grep,Glob,Edit,Write,Bash"   --disallowedTools "Bash(rm *),Bash(git push *),Bash(git reset --hard *)"
+bq report            # in the morning
+```
+
+`--checkpoint` commits the working tree after every task, tagged with the task
+id, so the morning is "review seven commits" rather than "diff twelve hours of
+mixed edits" -- and any one of them is `git revert`-able. Anything already
+uncommitted when a task starts is committed separately first, so reverting the
+task does not take your own work with it. It never pushes.
+
+**A deny-list is not a boundary.** `rm` is reachable through `python -c`,
+`find -delete`, `git clean`. Denying the obvious commands prevents accidents;
+it does not contain a determined path. The commit per task is what actually
+makes the night reversible, which is why the two belong together.
+
+`bq report` prints what ran, the commit and file stats for each, anything that
+deleted files, and a "needs you" list of failures with their reasons.
+
+## 7. Don't wait at all (optional)
 
 API billing is metered separately from your subscription, so a locked-out
 subscription doesn't block an API key:
@@ -201,7 +225,7 @@ effect on a daemon that's already running.
 On a usage limit the daemon retries the task on the API key instead of sleeping.
 This costs money per token — that's the trade. Without the flag it just waits.
 
-## 7. Flags
+## 8. Flags
 
 | Flag | Why |
 |---|---|
@@ -209,6 +233,8 @@ This costs money per token — that's the trade. Without the flag it just waits.
 | `--chain` | Thread tasks into one session so task2 sees task1's work |
 | `--max-sleep 21600` | Stop rather than sleep past this (weekly-limit guard) |
 | `--stale-after 1800` | How long a silent claim is left alone before it's retried |
+| `--checkpoint` | Commit the tree after each task, so a night's work is reviewable |
+| `--report [h]` | What ran, what changed, what needs you (also `bq report`) |
 | `--max-retries 3` | Attempts before a task is marked failed |
 | `--timeout 3600` | Per-task wall clock |
 | `--` | Everything after it goes to the CLI: `-- --model opus --allowedTools Read,Edit` |
@@ -224,7 +250,7 @@ Everything after `--` goes straight to the CLI. `--claude-arg` takes a single
 value and needs `--claude-arg=--flag` for anything starting with a dash, so `--`
 is usually what you want.
 
-## 8. Windows notes
+## 9. Windows notes
 
 Supported natively. You install `bin\bq.cmd` rather than `bin/bq`, but you
 still *type* `bq` — PowerShell and cmd resolve it through `PATHEXT`.

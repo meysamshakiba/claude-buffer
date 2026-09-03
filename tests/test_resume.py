@@ -45,6 +45,7 @@ def args(**over):
         watch=False, poll=0, cli="claude", claude_arg=[], timeout=60,
         chain=False, fallback_api_key=False, max_retries=3,
         max_sleep=drain.DEFAULT_MAX_SLEEP, stale_after=drain.STALE_AFTER,
+        checkpoint=False,
     )
     base.update(over)
     return argparse.Namespace(**base)
