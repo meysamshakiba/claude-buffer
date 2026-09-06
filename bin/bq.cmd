@@ -34,6 +34,14 @@ if "%~1"=="status" (
   "%PYTHON%" "%D%" --status
   exit /b %ERRORLEVEL%
 )
+if "%~1"=="sessions" (
+  "%PYTHON%" "%BUFFER_SKILL_DIR%\scripts\sessions.py"
+  exit /b %ERRORLEVEL%
+)
+if "%~1"=="summary" (
+  "%PYTHON%" "%BUFFER_SKILL_DIR%\scripts\sessions.py" --summary %2
+  exit /b %ERRORLEVEL%
+)
 if "%~1"=="report" (
   set "H=%~2"
   if "%~2"=="" set "H=12"

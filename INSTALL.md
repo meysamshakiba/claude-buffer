@@ -202,7 +202,36 @@ makes the night reversible, which is why the two belong together.
 `bq report` prints what ran, the commit and file stats for each, anything that
 deleted files, and a "needs you" list of failures with their reasons.
 
-## 7. Don't wait at all (optional)
+## 7. Handover across a usage limit
+
+A limit stops a session mid-token. Nothing inside it gets to write a handover
+first, and writing one would need a model call -- the one thing a lockout
+forbids. So the daemon assembles it afterwards, from evidence that outlives the
+session:
+
+- the task text, verbatim
+- the commits that attempt produced, and their diffstat
+- uncommitted leftovers, if any
+- the session id, attempt number, and which limit stopped it
+
+None of that needs the API, so it works while you are locked out.
+
+```bash
+bq sessions            # every attempt: task, session id, repo, how it ended
+bq summary <task-id>   # the markdown handover for one task
+```
+
+Records land in `~/.claude/buffer/sessions.db` (SQLite) with the markdown kept
+both in the row and as a file under `summaries/`.
+
+**Resuming still comes first.** Reopening the conversation replays the real
+thing and beats any summary of it. The handover is what happens when that is
+impossible -- an expired, pruned, or foreign session -- and instead of starting
+cold, the new session is given the summary and told to treat that work as done.
+It is also the cheaper option for a very long conversation: resuming re-primes
+the whole context, and a measured trivial resume cost $0.23 in cache alone.
+
+## 8. Don't wait at all (optional)
 
 API billing is metered separately from your subscription, so a locked-out
 subscription doesn't block an API key:
@@ -225,7 +254,7 @@ effect on a daemon that's already running.
 On a usage limit the daemon retries the task on the API key instead of sleeping.
 This costs money per token — that's the trade. Without the flag it just waits.
 
-## 8. Flags
+## 9. Flags
 
 | Flag | Why |
 |---|---|
@@ -250,7 +279,7 @@ Everything after `--` goes straight to the CLI. `--claude-arg` takes a single
 value and needs `--claude-arg=--flag` for anything starting with a dash, so `--`
 is usually what you want.
 
-## 9. Windows notes
+## 10. Windows notes
 
 Supported natively. You install `bin\bq.cmd` rather than `bin/bq`, but you
 still *type* `bq` — PowerShell and cmd resolve it through `PATHEXT`.

@@ -26,6 +26,7 @@ import json
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -34,6 +35,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+import sessions
 from buffer_queue import (
     STALE_AFTER,
     Queue,
@@ -79,6 +81,16 @@ RESUME_PROMPT = (
     "The conversation above is your own work on it so far. Continue from where "
     "you stopped: finish what is unfinished, and don't redo what is already done."
 )
+# Used when the conversation itself is gone — expired, pruned, another machine.
+# The handover the daemon assembled is all the context that survives.
+COLD_RESUME_PROMPT = (
+    "This task was started before and interrupted by a usage limit. The earlier "
+    "conversation can no longer be opened, so here is what is known about it.\n\n"
+    "{summary}\n\n"
+    "---\n\nThe original task was:\n\n{text}\n\n"
+    "Continue it. Treat the work described above as already done — verify it "
+    "rather than repeating it — and finish what is left."
+)
 # A stored session that the CLI won't resume — expired, pruned, or from another
 # machine — must not strand the task on a conversation that no longer exists.
 RESUME_FAILED_RE = re.compile(
@@ -94,8 +106,20 @@ INBOX_SETTLE = 5                   # let a syncing file finish landing
 WORKER_ID = f"drain-{default_worker()}"
 
 
+# Set once the queue actually in use is known. Without it every derived file --
+# the log, the pid, the database, the summaries -- lands next to the *default*
+# queue even when --file points somewhere else, so a second queue silently
+# shares the first one's state. See issue #5.
+_state_root: Path | None = None
+
+
+def use_state_for(queue: Path) -> None:
+    global _state_root
+    _state_root = queue.parent
+
+
 def state_dir() -> Path:
-    d = queue_path().parent
+    d = _state_root or queue_path().parent
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -106,6 +130,18 @@ def pid_file() -> Path:
 
 def state_file() -> Path:
     return state_dir() / "drain.state"
+
+
+def db_path() -> Path:
+    return state_dir() / "sessions.db"
+
+
+def where_of(cwd: str | None) -> str:
+    return f" in {cwd}" if cwd else ""
+
+
+def summaries_dir() -> Path:
+    return state_dir() / "summaries"
 
 
 def set_state(**kw) -> None:
@@ -554,6 +590,7 @@ def queue_op(path: Path, fn, retries: int = 3):
 
 
 def drain(args, path: Path) -> int:
+    use_state_for(path)
     # Only claims nobody is maintaining. The queue is shared with `bq` and with
     # any Claude session draining inline, so a blanket requeue here would drag
     # someone else's in-flight task back to pending underneath them.
@@ -596,12 +633,20 @@ def drain(args, path: Path) -> int:
         # work already done still in view, rather than starting the task over.
         resume_sid = task.get("session")
         task_cwd = task.get("cwd")
-        prompt = RESUME_PROMPT.format(text=text) if resume_sid else text
-        where = f" in {task_cwd}" if task_cwd else ""
+        start_head = sessions.head_of(task_cwd)
+        handover = sessions.latest_summary(db_path(), tid)
+
         if resume_sid:
-            log(f"Resuming [{tid}] in session {resume_sid}{where}")
+            prompt = RESUME_PROMPT.format(text=text)
+            log(f"Resuming [{tid}] in session {resume_sid}{where_of(task_cwd)}")
+        elif handover:
+            # No session to reopen, but this task has been attempted before.
+            # Sending it cold would repeat work that is already committed.
+            prompt = COLD_RESUME_PROMPT.format(summary=handover, text=text)
+            log(f"Restarting [{tid}] from its summary{where_of(task_cwd)}")
         else:
-            log(f"Running [{tid}]{where} {text}")
+            prompt = text
+            log(f"Running [{tid}]{where_of(task_cwd)} {text}")
             resume_sid = chain_session if args.chain else None
 
         # Commit anything already lying around first, so this task's diff is
@@ -649,6 +694,31 @@ def drain(args, path: Path) -> int:
             if interrupted:
                 queue_op(path, lambda q: q.set_session(tid, interrupted))
                 log(f"Will resume [{tid}] in session {interrupted} after the reset.")
+
+            # Write the handover now, while the daemon is alive and the
+            # evidence is fresh. Nothing inside the session could have done
+            # this: it was stopped mid-token, and summarising needs a model
+            # call, which is the one thing a lockout forbids.
+            try:
+                summary = sessions.build_summary(
+                    task_id=tid, prompt=text, session_id=interrupted,
+                    repo=task_cwd, start_head=start_head,
+                    attempt=attempts[tid] + 1, reason=f"{kind} limit",
+                    result_text=output,
+                )
+                summaries_dir().mkdir(parents=True, exist_ok=True)
+                md = summaries_dir() / f"{tid}-{int(time.time())}.md"
+                md.write_text(summary, encoding="utf-8")
+                sessions.record(
+                    db_path(), task_id=tid, prompt=text, session_id=interrupted,
+                    repo=task_cwd, repo_head=start_head, status="interrupted",
+                    reason=f"{kind} limit", attempt=attempts[tid] + 1,
+                    summary=summary, summary_path=str(md),
+                )
+                log(f"Wrote handover {md.name}")
+            except (OSError, sqlite3.Error) as exc:
+                # Bookkeeping must never cost us the queue.
+                log(f"Could not record the handover: {exc}")
 
             # Subscription window is exhausted. If an API key is configured,
             # keep working on metered billing instead of sleeping.
@@ -701,6 +771,20 @@ def drain(args, path: Path) -> int:
         # has done its job. Leaving it would resume a finished conversation.
         if task.get("session"):
             queue_op(path, lambda q: q.set_session(tid, None))
+
+        # Close the record either way, so the database shows how a task ended
+        # and not only that it once stalled.
+        if ok or attempts[tid] >= args.max_retries:
+            try:
+                sessions.record(
+                    db_path(), task_id=tid, prompt=text, session_id=session_id,
+                    repo=task_cwd, repo_head=sessions.head_of(task_cwd),
+                    status="done" if ok else "failed",
+                    reason="" if ok else "attempts exhausted",
+                    attempt=attempts[tid],
+                )
+            except sqlite3.Error as exc:
+                log(f"Could not record the run: {exc}")
 
         if ok:
             if args.chain and session_id:

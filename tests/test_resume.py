@@ -119,7 +119,10 @@ def test_unresumable_session_falls_back_to_a_cold_run(qpath, queued, monkeypatch
     assert drain.drain(args(), qpath) == 0
 
     assert [c["resume"] for c in fake.calls] == [None, "sess-gone", None]
-    assert fake.calls[2]["text"] == "write the report"  # cold, not the resume prompt
+    # Not resumed, but not cold either: the handover the daemon wrote when the
+    # limit landed carries the context the lost conversation was holding.
+    assert "write the report" in fake.calls[2]["text"]
+    assert "already done" in fake.calls[2]["text"]
     (task,) = tasks(qpath)
     assert task["status"] == "done"
 
