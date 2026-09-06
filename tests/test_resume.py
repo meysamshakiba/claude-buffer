@@ -100,7 +100,16 @@ def test_session_outlives_the_daemon(qpath, queued, monkeypatch):
     assert task["session"] == "sess-xyz"
     assert "session=sess-xyz" in qpath.read_text(encoding="utf-8")
 
-    # A brand new drain, as if the daemon were restarted after the reset.
+    # Restarted by the supervisor while the lockout still stands: it must not
+    # spend a call rediscovering a limit it already knows about.
+    too_early = FakeCLI({"mode": "ok"})
+    monkeypatch.setattr(drain, "run_task", too_early)
+    assert drain.drain(args(), qpath) == 0
+    assert too_early.calls == []
+
+    # Restarted once the reset has passed: now it resumes the same session.
+    drain.set_state(state="locked_out", task=task["id"],
+                    until=int(time.time()) - 1, reason="usage limit")
     fake = FakeCLI({"mode": "ok"})
     monkeypatch.setattr(drain, "run_task", fake)
     assert drain.drain(args(), qpath) == 0

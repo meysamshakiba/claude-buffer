@@ -465,14 +465,26 @@ def main() -> int:
                 {"requeued": q.reset_running(args.stale_after, force=args.force)},
                 args.json,
             )
-        elif args.cmd == "done":
-            emit(q.set_status(args.id, "done"), args.json)
-        elif args.cmd == "fail":
-            emit(q.set_status(args.id, "failed", args.note or "failed"), args.json)
-        elif args.cmd == "requeue":
-            emit(q.set_status(args.id, "pending", ""), args.json)
+        # A mutation that matched nothing used to print "(none)" and exit 0,
+        # so a typo'd id looked exactly like success -- and a script or a
+        # Claude session driving the queue had no way to notice it no-op'd.
+        elif args.cmd in ("done", "fail", "requeue"):
+            status, note = {
+                "done": ("done", None),
+                "fail": ("failed", args.note or "failed" if args.cmd == "fail" else None),
+                "requeue": ("pending", ""),
+            }[args.cmd]
+            task = q.set_status(args.id, status, note)
+            emit(task, args.json)
+            if task is None:
+                print(f"No task with id {args.id}.", file=sys.stderr)
+                return 1
         elif args.cmd == "remove":
-            emit({"removed": q.remove(args.id)}, args.json)
+            removed = q.remove(args.id)
+            emit({"removed": removed}, args.json)
+            if not removed:
+                print(f"No task with id {args.id}.", file=sys.stderr)
+                return 1
         elif args.cmd == "status":
             emit({"queue": str(path), **q.counts()}, args.json)
         elif args.cmd == "list":

@@ -55,6 +55,15 @@ if "%~1"=="autostart" (
   exit /b %ERRORLEVEL%
 )
 
+REM Queue subcommands go to the queue. Without this `bq list` enqueued a task
+REM called "list", which the daemon then dutifully ran as a prompt.
+set "QCMDS= add list peek claim heartbeat done fail requeue reset remove clear "
+echo %QCMDS% | findstr /i /c:" %~1 " >nul
+if not errorlevel 1 (
+  "%PYTHON%" "%Q%" %*
+  exit /b %ERRORLEVEL%
+)
+
 "%PYTHON%" "%Q%" add %*
 if errorlevel 1 exit /b %ERRORLEVEL%
 REM Make sure something will actually run it.

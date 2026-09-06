@@ -35,6 +35,61 @@ def test_a_single_flag_value_still_works_with_equals():
     assert run_cli("--claude-arg=--allowedTools").returncode != 2
 
 
+# -- a lockout longer than the daemon will wait ----------------------------
+
+
+def test_a_recorded_lockout_stops_the_next_run_spending_a_call(
+    qpath, tmp_path, monkeypatch
+):
+    """The supervisor restarts the daemon every 15 minutes. Past a weekly
+    limit that meant claiming a task, burning a call to rediscover the same
+    lockout, and exiting -- all night."""
+    from buffer_queue import Queue
+    from test_resume import FakeCLI, args
+
+    monkeypatch.setattr(drain, "state_dir", lambda: tmp_path)
+    with Queue(qpath) as q:
+        q.add("do the thing")
+
+    drain.set_state(state="locked_out", task="abc",
+                    until=int(time.time()) + 3 * 3600, reason="weekly limit")
+
+    fake = FakeCLI({"mode": "ok"})
+    monkeypatch.setattr(drain, "run_task", fake)
+    assert drain.drain(args(), qpath) == 0
+    assert fake.calls == []                     # no call spent
+    with Queue(qpath) as q:
+        assert q.tasks[0]["status"] == "pending"  # and the task is untouched
+
+
+def test_once_the_lockout_passes_work_resumes(qpath, tmp_path, monkeypatch):
+    from buffer_queue import Queue
+    from test_resume import FakeCLI, args
+
+    monkeypatch.setattr(drain, "state_dir", lambda: tmp_path)
+    with Queue(qpath) as q:
+        q.add("do the thing")
+    drain.set_state(state="locked_out", task="abc",
+                    until=int(time.time()) - 5, reason="weekly limit")
+
+    fake = FakeCLI({"mode": "ok"})
+    monkeypatch.setattr(drain, "run_task", fake)
+    assert drain.drain(args(), qpath) == 0
+    assert len(fake.calls) == 1
+
+
+def test_a_lockout_says_how_long_is_left():
+    now = 1_700_000_000
+    line = drain.describe_state(
+        {"state": "locked_out", "until": now + 3 * 3600 + 600,
+         "reason": "weekly limit", "task": "abc"},
+        now=now,
+    )
+    assert "locked out by the weekly limit" in line
+    assert "3h 10m" in line
+    assert "not spending calls" in line
+
+
 def test_sleeping_says_when_it_wakes_and_what_resumes():
     now = 1_700_000_000
     line = drain.describe_state(

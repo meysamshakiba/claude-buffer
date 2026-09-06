@@ -173,6 +173,14 @@ def describe_state(state: dict, now: float | None = None) -> str:
     kind = state.get("state")
     task = f" [{state['task']}]" if state.get("task") else ""
 
+    if kind == "locked_out":
+        left = int(state.get("until", 0) - now)
+        if left > 0:
+            when = datetime.fromtimestamp(state["until"]).strftime("%a %H:%M")
+            return (f"locked out by the {state.get('reason', 'limit')} until "
+                    f"{when} ({left // 3600}h {left % 3600 // 60}m); "
+                    f"not spending calls until then")
+        return "lockout has lifted; next check picks the queue back up"
     if kind == "sleeping":
         left = int(state.get("until", 0) - now)
         if left > 0:
@@ -591,6 +599,18 @@ def queue_op(path: Path, fn, retries: int = 3):
 
 def drain(args, path: Path) -> int:
     use_state_for(path)
+
+    # A previous run hit a limit resetting further out than it was willing to
+    # wait. Until that passes there is nothing to do but leave: claiming a task
+    # would only spend a call to be told the same thing.
+    previous = read_state()
+    if previous.get("state") == "locked_out":
+        left = int(previous.get("until", 0) - time.time())
+        if left > 0:
+            log(f"Still locked out for {left // 60}m "
+                f"({previous.get('reason', 'limit')}). Nothing to do yet.")
+            return 0
+        log("Lockout has lifted; picking the queue back up.")
     # Only claims nobody is maintaining. The queue is shared with `bq` and with
     # any Claude session draining inline, so a blanket requeue here would drag
     # someone else's in-flight task back to pending underneath them.
@@ -744,8 +764,12 @@ def drain(args, path: Path) -> int:
                 set_state(state="sleeping", task=tid, until=reset_epoch + 60,
                           reason=f"{kind} limit")
                 if not sleep_until(reset_epoch, kind, args.max_sleep):
-                    set_state(state="stopped", task=tid,
-                              reason=f"{kind} limit resets beyond --max-sleep")
+                    # Remember when the lockout lifts. The supervisor restarts
+                    # this process every 15 minutes, and without a record each
+                    # restart would claim the task, burn a call to rediscover
+                    # the same limit, and exit -- all night, for nothing.
+                    set_state(state="locked_out", task=tid, until=reset_epoch + 60,
+                              reason=f"{kind} limit")
                     return 2
             else:
                 log(f"Limit hit, reset time unknown. Sleeping {DEFAULT_BACKOFF // 60}m.")

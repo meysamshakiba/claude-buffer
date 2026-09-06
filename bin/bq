@@ -21,6 +21,10 @@ case "${1:-}" in
   sessions) "$PY" "$SKILL/scripts/sessions.py" ;;
   summary) "$PY" "$SKILL/scripts/sessions.py" --summary "${2:-}" ;;
   report) "$PY" "$SKILL/scripts/drain.py" --report "${2:-12}" ;;
+  # Queue subcommands go to the queue. Without this `bq list` enqueued a task
+  # called "list", which the daemon then dutifully ran as a prompt.
+  add|list|peek|claim|heartbeat|done|fail|requeue|reset|remove|clear)
+          "$PY" "$SKILL/scripts/buffer_queue.py" "$@" ;;
   autostart) "$PY" "$SKILL/scripts/autostart.py" "--${2:-install}" ;;
   *)      "$PY" "$SKILL/scripts/buffer_queue.py" add "$*"
           # Make sure something will actually run it.
