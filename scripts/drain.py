@@ -102,6 +102,7 @@ RESUME_FAILED_RE = re.compile(
 # A limit doesn't count against a task's retries, so a task misread as limited
 # would retry forever. Bound it: past this many, treat it as a real failure.
 MAX_LIMIT_HITS = 5
+PROBE_EVERY = 15 * 60      # retry cadence while a lockout stands
 HEARTBEAT_EVERY = 300              # well inside STALE_AFTER, cheap to write
 INBOX_SETTLE = 5                   # let a syncing file finish landing
 WORKER_ID = f"drain-{default_worker()}"
@@ -180,7 +181,7 @@ def describe_state(state: dict, now: float | None = None) -> str:
             when = datetime.fromtimestamp(state["until"]).strftime("%a %H:%M")
             return (f"locked out by the {state.get('reason', 'limit')} until "
                     f"{when} ({left // 3600}h {left % 3600 // 60}m); "
-                    f"not spending calls until then")
+                    f"retrying every {PROBE_EVERY // 60}m in case it lifts early")
         return "lockout has lifted; next check picks the queue back up"
     if kind == "sleeping":
         left = int(state.get("until", 0) - now)
@@ -647,17 +648,34 @@ def queue_op(path: Path, fn, retries: int = 3):
 def drain(args, path: Path) -> int:
     use_state_for(path)
 
-    # A previous run hit a limit resetting further out than it was willing to
-    # wait. Until that passes there is nothing to do but leave: claiming a task
-    # would only spend a call to be told the same thing.
+    # A previous run hit a limit that reset further out than it was willing to
+    # wait. Worth remembering -- but not worth obeying blindly, which is what
+    # this used to do. Two reasons that was wrong. A refused call comes back
+    # 429 without consuming quota, so the "don't spend a call" it was written
+    # to protect does not exist. And the reset time is the CLI's estimate of
+    # one bucket; a different bucket, or a new week, can free things up long
+    # before it. Sitting out a 14-hour window on a stale guess means the queue
+    # does nothing while the user watches usage sit there unused.
+    #
+    # So: probe. Slowly enough that a genuine lockout is quiet, often enough
+    # that returning quota gets picked up within the quarter hour.
     previous = read_state()
     if previous.get("state") == "locked_out":
         left = int(previous.get("until", 0) - time.time())
-        if left > 0:
-            log(f"Still locked out for {left // 60}m "
-                f"({previous.get('reason', 'limit')}). Nothing to do yet.")
+        waited = time.time() - float(previous.get("probed") or 0)
+        if left > 0 and waited < PROBE_EVERY:
+            log(f"Locked out for another {left // 60}m; probed "
+                f"{int(waited // 60)}m ago, next probe in "
+                f"{int((PROBE_EVERY - waited) // 60)}m.")
             return 0
-        log("Lockout has lifted; picking the queue back up.")
+        if left > 0:
+            log(f"Locked out for another {left // 60}m on the last estimate, "
+                f"but limits lift early. Trying one task.")
+            set_state(state="locked_out", task=previous.get("task"),
+                      until=previous.get("until"), reason=previous.get("reason"),
+                      probed=int(time.time()))
+        else:
+            log("Lockout has lifted; picking the queue back up.")
     # Only claims nobody is maintaining. The queue is shared with `bq` and with
     # any Claude session draining inline, so a blanket requeue here would drag
     # someone else's in-flight task back to pending underneath them.
@@ -842,12 +860,13 @@ def drain(args, path: Path) -> int:
                 set_state(state="sleeping", task=tid, until=reset_epoch + 60,
                           reason=f"{kind} limit")
                 if not sleep_until(reset_epoch, kind, args.max_sleep):
-                    # Remember when the lockout lifts. The supervisor restarts
-                    # this process every 15 minutes, and without a record each
-                    # restart would claim the task, burn a call to rediscover
-                    # the same limit, and exit -- all night, for nothing.
+                    # Remember when the lockout lifts, so the supervisor's
+                    # 15-minute restarts stay quiet rather than each one
+                    # rediscovering the same limit from scratch.
+                    # probed=now, so the first retry is PROBE_EVERY away
+                    # rather than immediate: this limit is freshly confirmed.
                     set_state(state="locked_out", task=tid, until=reset_epoch + 60,
-                              reason=f"{kind} limit")
+                              reason=f"{kind} limit", probed=int(time.time()))
                     return 2
             else:
                 log(f"Limit hit, reset time unknown. Sleeping {DEFAULT_BACKOFF // 60}m.")

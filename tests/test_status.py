@@ -38,12 +38,9 @@ def test_a_single_flag_value_still_works_with_equals():
 # -- a lockout longer than the daemon will wait ----------------------------
 
 
-def test_a_recorded_lockout_stops_the_next_run_spending_a_call(
-    qpath, tmp_path, monkeypatch
-):
-    """The supervisor restarts the daemon every 15 minutes. Past a weekly
-    limit that meant claiming a task, burning a call to rediscover the same
-    lockout, and exiting -- all night."""
+def test_a_freshly_confirmed_lockout_stays_quiet(qpath, tmp_path, monkeypatch):
+    """The supervisor restarts the daemon every 15 minutes. Right after a
+    limit is confirmed there is no point rediscovering it every time."""
     from buffer_queue import Queue
     from test_resume import FakeCLI, args
 
@@ -52,14 +49,65 @@ def test_a_recorded_lockout_stops_the_next_run_spending_a_call(
         q.add("do the thing")
 
     drain.set_state(state="locked_out", task="abc",
-                    until=int(time.time()) + 3 * 3600, reason="weekly limit")
+                    until=int(time.time()) + 3 * 3600, reason="weekly limit",
+                    probed=int(time.time()))
 
     fake = FakeCLI({"mode": "ok"})
     monkeypatch.setattr(drain, "run_task", fake)
     assert drain.drain(args(), qpath) == 0
-    assert fake.calls == []                     # no call spent
+    assert fake.calls == []                     # nothing spent
     with Queue(qpath) as q:
         assert q.tasks[0]["status"] == "pending"  # and the task is untouched
+
+
+def test_a_standing_lockout_is_retried_rather_than_obeyed(qpath, tmp_path,
+                                                          monkeypatch):
+    """Limits lift early -- a different bucket, a new week -- and the reset
+    time is only the CLI's estimate. Sitting out the whole window meant the
+    queue did nothing while usage sat there unused, which is the complaint
+    that prompted this. A refused call is a free 429, so probing costs
+    nothing."""
+    from buffer_queue import Queue
+    from test_resume import FakeCLI, args
+
+    monkeypatch.setattr(drain, "state_dir", lambda: tmp_path)
+    with Queue(qpath) as q:
+        q.add("do the thing")
+
+    # locked out for hours yet, but last probed longer ago than the cadence
+    drain.set_state(state="locked_out", task="abc",
+                    until=int(time.time()) + 3 * 3600, reason="weekly limit",
+                    probed=int(time.time()) - drain.PROBE_EVERY - 1)
+
+    fake = FakeCLI({"mode": "ok"})
+    monkeypatch.setattr(drain, "run_task", fake)
+    assert drain.drain(args(), qpath) == 0
+    assert len(fake.calls) == 1                 # it tried, and quota was back
+    with Queue(qpath) as q:
+        assert q.tasks[0]["status"] == "done"
+
+
+def test_a_probe_that_hits_the_limit_again_backs_off(qpath, tmp_path,
+                                                     monkeypatch):
+    """Probing must not become hammering: a failed probe re-stamps the
+    lockout so the next restart is quiet again."""
+    from buffer_queue import Queue
+    from test_resume import FUTURE, FakeCLI, args
+
+    monkeypatch.setattr(drain, "state_dir", lambda: tmp_path)
+    with Queue(qpath) as q:
+        q.add("do the thing")
+    drain.set_state(state="locked_out", task="abc", until=int(time.time()) + 3600,
+                    reason="weekly limit",
+                    probed=int(time.time()) - drain.PROBE_EVERY - 1)
+
+    monkeypatch.setattr(drain, "run_task",
+                        FakeCLI({"mode": "limit", "sid": "s", "epoch": FUTURE}))
+    drain.drain(args(max_sleep=0), qpath)
+
+    state = drain.read_state()
+    assert state["state"] == "locked_out"
+    assert state["probed"] >= int(time.time()) - 5
 
 
 def test_once_the_lockout_passes_work_resumes(qpath, tmp_path, monkeypatch):
@@ -87,7 +135,7 @@ def test_a_lockout_says_how_long_is_left():
     )
     assert "locked out by the weekly limit" in line
     assert "3h 10m" in line
-    assert "not spending calls" in line
+    assert "retrying every 15m" in line
 
 
 def test_sleeping_says_when_it_wakes_and_what_resumes():
