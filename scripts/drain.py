@@ -35,6 +35,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+import notify
 import sessions
 from buffer_queue import (
     STALE_AFTER,
@@ -205,6 +206,12 @@ def log(msg: str) -> None:
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
 
+# A notification that silently isn't going out is worse than none at all: the
+# whole point is being told without having to ask. Route ntfy's own complaints
+# into the daemon log, where `bq log` will find them.
+notify.set_reporter(lambda msg: log(f"ntfy: {msg}"))
+
+
 # -- daemon lifecycle ------------------------------------------------------
 
 
@@ -362,14 +369,54 @@ def detect_limit(
     return None, ""
 
 
+def wait_for(epoch: int, max_sleep: int, pad: int = 60) -> tuple[int, bool]:
+    """Seconds until a reset, and whether that is longer than we will wait.
+
+    Shared with the notification so the phone is told the plan the daemon
+    actually follows, rather than a second guess at it.
+    """
+    remaining = max(0, epoch + pad - int(time.time()))
+    return remaining, remaining > max_sleep
+
+
+def limit_message(kind: str, tid: str, reset_epoch: int, max_sleep: int,
+                  fallback: bool) -> str:
+    """One line for a phone: which limit, when it lifts, what happens next.
+
+    "Usage limit" on its own is the message that gets someone out of bed to
+    check. What they actually need to know is whether the queue is still
+    moving without them.
+    """
+    when = (f"Resets {datetime.fromtimestamp(reset_epoch + 60):%a %H:%M}"
+            if reset_epoch else "Reset time unknown")
+    if fallback:
+        plan = "retrying now on API-key billing instead of waiting"
+    elif not reset_epoch:
+        plan = f"retrying in {DEFAULT_BACKOFF // 60}m"
+    else:
+        remaining, too_long = wait_for(reset_epoch, max_sleep)
+        plan = (
+            "beyond --max-sleep, so the daemon is stopping; the queue is intact "
+            "and picks up when it is restarted after the reset"
+            if too_long else f"sleeping {remaining // 60}m, then [{tid}] continues"
+        )
+    return f"{kind} limit hit on [{tid}]. {when}; {plan}."
+
+
+def drained_message(completed: dict[str, int]) -> str:
+    done, failed = completed.get("done", 0), completed.get("failed", 0)
+    tally = f"{done} done" + (f", {failed} failed" if failed else "")
+    return f"{tally}. Nothing left in the queue."
+
+
 def sleep_until(epoch: int, kind: str, max_sleep: int, pad: int = 60) -> bool:
     """Sleep until the reset. Returns False if the wait exceeds max_sleep, so
     a 7-day weekly lockout doesn't turn into a silent week-long sleep."""
     target = epoch + pad
-    remaining = max(0, target - int(time.time()))
+    remaining, too_long = wait_for(epoch, max_sleep, pad)
     if remaining <= 0:
         return True
-    if remaining > max_sleep:
+    if too_long:
         log(
             f"{kind} limit resets {datetime.fromtimestamp(target):%a %H:%M} "
             f"({remaining // 3600}h away), beyond --max-sleep. Stopping. "
@@ -622,6 +669,14 @@ def drain(args, path: Path) -> int:
     attempts: dict[str, int] = {}
     limit_hits: dict[str, int] = {}
     chain_session: str | None = None
+    completed = {"done": 0, "failed": 0}
+
+    def announce_drained() -> None:
+        """Say the queue is empty -- once per drain, not once per idle poll,
+        and not at all when this worker never had anything to do."""
+        if any(completed.values()):
+            notify.event("drained", drained_message(completed))
+            completed.update(done=0, failed=0)
 
     while True:
         # Before claiming, so anything dropped while the last task ran joins
@@ -632,6 +687,7 @@ def drain(args, path: Path) -> int:
 
         if task is None:
             if not args.watch:
+                announce_drained()
                 log("Queue empty. Done.")
                 return 0
             # Idle is the right moment to notice that another worker died
@@ -641,6 +697,7 @@ def drain(args, path: Path) -> int:
             if recovered:
                 log(f"Recovered {recovered} abandoned task(s) from another worker.")
                 continue
+            announce_drained()
             set_state(state="idle", since=int(time.time()))
             time.sleep(args.poll)
             continue
@@ -668,6 +725,8 @@ def drain(args, path: Path) -> int:
             prompt = text
             log(f"Running [{tid}]{where_of(task_cwd)} {text}")
             resume_sid = chain_session if args.chain else None
+
+        notify.event("started", f"[{tid}] {text}{where_of(task_cwd)}")
 
         # Commit anything already lying around first, so this task's diff is
         # its own and reverting it doesn't take unrelated work with it.
@@ -700,6 +759,8 @@ def drain(args, path: Path) -> int:
         if reset_epoch is not None and limit_hits.get(tid, 0) >= MAX_LIMIT_HITS:
             note = f"limit detected {MAX_LIMIT_HITS}x without progress; giving up"
             queue_op(path, lambda q: q.set_status(tid, "failed", note))
+            completed["failed"] += 1
+            notify.event("failed", f"[{tid}] {text}\n{note}")
             log(f"Giving up on [{tid}]: {note}")
             continue
 
@@ -742,7 +803,15 @@ def drain(args, path: Path) -> int:
 
             # Subscription window is exhausted. If an API key is configured,
             # keep working on metered billing instead of sleeping.
-            if args.fallback_api_key and os.environ.get("BUFFER_FALLBACK_API_KEY"):
+            use_fallback = bool(
+                args.fallback_api_key and os.environ.get("BUFFER_FALLBACK_API_KEY")
+            )
+            notify.event(
+                "limit",
+                limit_message(kind, tid, reset_epoch, args.max_sleep, use_fallback),
+            )
+
+            if use_fallback:
                 log(f"{kind} limit hit — retrying [{tid}] on API-key billing.")
                 with heartbeating(path, tid, WORKER_ID):
                     ok, output, session_id, harness = run_task(
@@ -755,9 +824,18 @@ def drain(args, path: Path) -> int:
                         chain_session = session_id
                     queue_op(path, lambda q: q.set_session(tid, None))
                     queue_op(path, lambda q: q.set_status(tid, "done", "via api key"))
+                    completed["done"] += 1
+                    notify.event("done", f"[{tid}] {text} (via API key)")
                     log(f"Done [{tid}] (api key)")
                     continue
+                # The phone was told the queue was still moving on metered
+                # billing. It isn't, and the correction matters more than the
+                # extra buzz: otherwise the next word arrives hours later.
                 log("API-key attempt also failed. Falling back to waiting.")
+                notify.event(
+                    "limit",
+                    limit_message(kind, tid, reset_epoch, args.max_sleep, fallback=False),
+                )
 
             queue_op(path, lambda q: q.set_status(tid, "pending", ""))
             if reset_epoch:
@@ -814,14 +892,23 @@ def drain(args, path: Path) -> int:
             if args.chain and session_id:
                 chain_session = session_id
             queue_op(path, lambda q: q.set_status(tid, "done"))
+            completed["done"] += 1
+            notify.event("done", f"[{tid}] {text}")
             log(f"Done [{tid}]")
         elif attempts[tid] < args.max_retries:
+            # No notification: this one is coming back round, and a phone that
+            # buzzes for an attempt that then succeeds teaches you to ignore it.
             queue_op(path, lambda q: q.set_status(tid, "pending", f"retry {attempts[tid]}"))
             log(f"Failed [{tid}], retrying ({attempts[tid]}/{args.max_retries}).")
             time.sleep(5 * attempts[tid])
         else:
             tail = output.strip().splitlines()[-1] if output.strip() else "no output"
             queue_op(path, lambda q: q.set_status(tid, "failed", tail[:160]))
+            completed["failed"] += 1
+            notify.event(
+                "failed",
+                f"[{tid}] {text}\nGave up after {attempts[tid]} attempts: {tail[:160]}",
+            )
             log(f"Giving up on [{tid}] after {attempts[tid]} attempts.")
 
 
@@ -951,13 +1038,23 @@ def main() -> int:
 
     if args.status:
         pid = daemon_pid()
+        # Where notifications go, if anywhere. A misconfigured topic is
+        # otherwise discovered by not being notified, which is the one failure
+        # mode this feature cannot afford. It is this shell's setting: a daemon
+        # inherits its environment at spawn time, so one started before the
+        # topic was exported is posting nowhere regardless of what this says.
+        target = notify.endpoint()
         if not pid:
             print("no daemon running")
+            if target:
+                print(f"  ntfy: {target}")
             return 1
         print(f"daemon running (pid {pid})")
         doing = describe_state(read_state())
         if doing:
             print(f"  {doing}")
+        if target:
+            print(f"  ntfy: {target}")
         return 0
 
     if args.report is not None:

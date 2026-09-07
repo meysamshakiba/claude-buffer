@@ -58,6 +58,7 @@ SKILL.md              instructions Claude loads for the skill
 commands/buffer.md    the /buffer slash command
 scripts/buffer_queue.py   queue state: add, claim, done, fail, list
 scripts/drain.py          the daemon: executes tasks, sleeps through limits
+scripts/notify.py         ntfy push notifications, off unless a topic is set
 bin/bq, bin/bq.cmd        shell entry point (POSIX / Windows)
 ```
 
@@ -82,6 +83,12 @@ when you wanted to jot the idea down.
 
 **It runs where you queued it.** Each task records the directory it came from,
 so one daemon serves every project and you never tell it a path.
+
+**It can tell your phone.** Set `BUFFER_NTFY_TOPIC` to an unguessable
+[ntfy.sh](https://ntfy.sh) topic and the daemon posts one notification per
+event — task started, done, failed, usage limit hit with the reset time, queue
+drained. `BUFFER_NTFY_URL` points it at a self-hosted server instead. With
+neither set nothing is sent and no request is made.
 
 **`bq autostart` keeps a daemon alive** across reboots and crashes, by
 re-running a command that is a no-op when one is already up.
@@ -108,7 +115,7 @@ raises the bar rather than lowering it — irreversible steps still wait for you
 
 ```bash
 pip install pytest ruff
-python -m pytest        # 26 tests, no network, no `claude` needed
+python -m pytest        # 119 tests, no network, no `claude` needed
 python -m ruff check scripts tests
 ```
 

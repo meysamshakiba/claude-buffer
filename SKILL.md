@@ -133,6 +133,16 @@ lives on the task in `queue.md`, so it survives the daemon being stopped
 mid-wait. If the conversation can't be reopened, the task runs cold rather than
 stalling on a chat that no longer exists.
 
+**It can push to a phone.** If `BUFFER_NTFY_TOPIC` is set, the daemon posts one
+[ntfy](https://ntfy.sh) notification per event — task started, done, failed,
+usage limit hit (with the reset time and what it will do until then), queue
+drained. `BUFFER_NTFY_URL` selects a self-hosted server, or carries a full topic
+URL on its own. Unset, nothing is sent and no request is made, so never claim
+the user will be notified without checking that a topic is configured —
+`drain.py --status` prints `ntfy: <url>` when one is. The daemon inherits
+its environment at spawn time, so a topic exported after it started is not the
+one it is posting to: stop it and start it again.
+
 **Two clocks.** Session limits reset in hours; weekly limits can be days out.
 `--max-sleep` (default 6h) stops the daemon rather than letting it silently
 sleep for a week. The queue survives; they restart it after the weekly reset.

@@ -202,7 +202,59 @@ makes the night reversible, which is why the two belong together.
 `bq report` prints what ran, the commit and file stats for each, anything that
 deleted files, and a "needs you" list of failures with their reasons.
 
-## 7. Handover across a usage limit
+## 7. Watching it from your phone
+
+`bq`, `bq report` and the log all need the machine the daemon runs on, and at
+2am you are not at that machine. Push notifications are the one channel that
+reaches you where you are, so the daemon can post an event to an
+[ntfy.sh](https://ntfy.sh) topic:
+
+```bash
+export BUFFER_NTFY_TOPIC=buffer-9f3a1c7d      # pick something unguessable
+bq                                            # confirms where it will post
+```
+
+```powershell
+$env:BUFFER_NTFY_TOPIC = "buffer-9f3a1c7d"
+```
+
+Install the ntfy app (iOS, Android, or the web at `ntfy.sh/your-topic`),
+subscribe to that topic, and that is the whole setup — no account, no key.
+
+One notification per event:
+
+| Event | Says |
+|---|---|
+| Task started | which task, and the directory it runs in |
+| Task done | which task finished, and whether it took the API-key path |
+| Task failed | the task, the attempts it used, and the last line of output |
+| Usage limit | which limit, when it resets, and what the daemon does until then |
+| Queue drained | the tally — `3 done, 1 failed. Nothing left in the queue.` |
+
+A retry that is going to run again is deliberately silent, and so is a daemon
+that starts up with an empty queue: a supervisor waking every 15 minutes would
+otherwise send 96 notifications a day saying nothing. A failure is the only
+event that arrives at a priority meant to be noticed at night.
+
+**Unset means off.** With no topic configured, nothing is sent and no request
+is made — the daemon behaves exactly as it did before this existed.
+
+Self-hosted, or a topic URL copied straight out of the app:
+
+```bash
+export BUFFER_NTFY_URL=https://ntfy.example.com   # server; topic is appended
+export BUFFER_NTFY_URL=https://ntfy.sh/buffer-9f3a1c7d   # or the whole thing
+```
+
+Two things worth knowing. The topic name is the only secret involved: anyone
+who knows it can read your task titles and post to it, so treat it like a
+password rather than a name. And the daemon inherits its environment when it is
+**spawned** — export the topic before `bq` or `bq autostart` starts one, or
+`bq stop` and let the next one pick it up. `bq` prints `ntfy: <url>` next to the
+daemon status, which is the quickest way to catch a topic that never made it
+across.
+
+## 8. Handover across a usage limit
 
 A limit stops a session mid-token. Nothing inside it gets to write a handover
 first, and writing one would need a model call -- the one thing a lockout
@@ -231,7 +283,7 @@ cold, the new session is given the summary and told to treat that work as done.
 It is also the cheaper option for a very long conversation: resuming re-primes
 the whole context, and a measured trivial resume cost $0.23 in cache alone.
 
-## 8. Don't wait at all (optional)
+## 9. Don't wait at all (optional)
 
 API billing is metered separately from your subscription, so a locked-out
 subscription doesn't block an API key:
@@ -254,7 +306,7 @@ effect on a daemon that's already running.
 On a usage limit the daemon retries the task on the API key instead of sleeping.
 This costs money per token — that's the trade. Without the flag it just waits.
 
-## 9. Flags
+## 10. Flags
 
 | Flag | Why |
 |---|---|
@@ -279,7 +331,12 @@ Everything after `--` goes straight to the CLI. `--claude-arg` takes a single
 value and needs `--claude-arg=--flag` for anything starting with a dash, so `--`
 is usually what you want.
 
-## 10. Windows notes
+Some settings are environment variables rather than flags, because they have to
+be set for whatever starts the daemon rather than typed each time:
+`CLAUDE_BUFFER_QUEUE` (§3), `CLAUDE_BUFFER_INBOX` (§5), `BUFFER_NTFY_TOPIC` and
+`BUFFER_NTFY_URL` (§7), and `BUFFER_FALLBACK_API_KEY` (§9).
+
+## 11. Windows notes
 
 Supported natively. You install `bin\bq.cmd` rather than `bin/bq`, but you
 still *type* `bq` — PowerShell and cmd resolve it through `PATHEXT`.
