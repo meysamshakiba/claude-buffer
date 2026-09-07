@@ -52,11 +52,22 @@ def write_launcher(extra: list[str]) -> Path:
     cmd = f'"{sys.executable}" "{DRAIN}" --daemon --watch'
     if extra:
         cmd += " " + " ".join(f'"{a}"' if " " in a or "," in a else a for a in extra)
+    # Pin the ntfy settings into the script rather than trusting the scheduler
+    # to hand them over. Task Scheduler builds a fresh environment block, so a
+    # user variable set after logon may not be there -- and that failure is
+    # silent by design: unconfigured means no notification and no error, which
+    # is indistinguishable from a phone that has simply stopped buzzing.
+    env = "".join(
+        f'set "{name}={value}"\r\n'
+        for name in ("BUFFER_NTFY_TOPIC", "BUFFER_NTFY_URL")
+        if (value := os.environ.get(name, "").strip())
+    )
+
     path = launcher_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "@echo off\r\nREM Written by autostart.py. Edit to change the daemon's\r\n"
-        "REM policy, then re-run the scheduled task.\r\n" + cmd + "\r\n",
+        "REM policy, then re-run the scheduled task.\r\n" + env + cmd + "\r\n",
         encoding="utf-8",
     )
     return path
