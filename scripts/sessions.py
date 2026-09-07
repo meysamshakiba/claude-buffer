@@ -32,6 +32,8 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+import ansi
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     run_id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,6 +100,83 @@ def commits_since(repo: str | None, since_head: str | None) -> list[tuple[str, s
     return rows
 
 
+def parse_result(text: str) -> dict:
+    """Pull the one human sentence out of the CLI's result JSON.
+
+    `claude -p --output-format json` ends with a blob carrying cache token
+    counts, per-model costs and a `result` field. Pasting the blob into a
+    handover buries the only line that matters -- "You've hit your session
+    limit, resets 12:30pm" -- under 2 KB of telemetry, and the handover is
+    read by someone working out what happened, often on a phone.
+    """
+    facts: dict = {"message": "", "turns": None, "cost": None}
+    raw = (text or "").strip()
+    if not raw:
+        return facts
+
+    blob = None
+    leftovers = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if blob is None and line.startswith("{") and line.endswith("}"):
+            try:
+                blob = json.loads(line)
+                continue
+            except ValueError:
+                pass
+        if line:
+            leftovers.append(line)
+
+    if blob is None:
+        facts["message"] = raw[-600:]        # not JSON; keep it as it came
+        return facts
+
+    facts["message"] = str(blob.get("result") or "").strip()
+    if not facts["message"] and leftovers:
+        facts["message"] = leftovers[-1][:600]
+    turns = blob.get("num_turns")
+    if isinstance(turns, int):
+        facts["turns"] = turns
+    cost = blob.get("total_cost_usd")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        facts["cost"] = float(cost)
+    return facts
+
+
+def _changed(repo: str | None, start_head: str | None) -> list[str]:
+    """The file-level story, as a short list rather than a diff dump."""
+    commits = commits_since(repo, start_head)
+    if commits:
+        out = [f"- `{sha}` {subject}" for sha, subject in commits]
+        # Subjects say what was intended; the file list says what actually
+        # moved, which is what stops the next session redoing it.
+        names = (_git(repo, "diff", "--name-status", f"{start_head}..HEAD")
+                 if start_head else "")
+        rows = [ln.split("	") for ln in names.splitlines() if ln.strip()]
+        for status, *rest in rows[:25]:
+            out.append(f"- `{status.strip()}` {rest[-1] if rest else ''}")
+        if len(rows) > 25:
+            out.append(f"- ...and {len(rows) - 25} more")
+        return out
+    if not repo:
+        return ["- not a git repository, so no record of file changes"]
+    dirty = [ln for ln in _git(repo, "status", "--porcelain").splitlines() if ln.strip()]
+    if not dirty:
+        return ["- nothing; the working tree is unchanged"]
+    # Uncommitted work is the interesting case: it is what the next session
+    # must not redo. Capped so a big sweep cannot crowd out the resume line.
+    # Split on whitespace rather than porcelain's fixed columns: _git strips
+    # the output, so the leading status column is gone on the first line and
+    # a column slice silently eats the first character of the filename.
+    shown = []
+    for ln in dirty[:25]:
+        status, _, name = ln.strip().partition(" ")
+        shown.append(f"- `{status or '??'}` {name.strip()}")
+    if len(dirty) > 25:
+        shown.append(f"- ...and {len(dirty) - 25} more")
+    return shown
+
+
 def build_summary(
     *,
     task_id: str,
@@ -108,62 +187,61 @@ def build_summary(
     attempt: int,
     reason: str,
     result_text: str = "",
+    when: str | None = None,
 ) -> str:
-    """Markdown handover for whatever picks this task up next."""
+    """Markdown handover for whatever picks this task up next.
+
+    Deliberately short. Its job is to answer three questions fast -- why did
+    it stop, what already landed, how do I continue -- and every extra line
+    pushes those answers further from the top.
+    """
+    facts = parse_result(result_text)
+
+    meta = [f"attempt {attempt}"]
+    if facts["turns"]:
+        meta.append(f"{facts['turns']} turns")
+    if facts["cost"]:
+        meta.append(f"${facts['cost']:.2f}")
+
+    where = f"`{repo}`" if repo else "_not recorded_"
+    if start_head:
+        where += f" @ `{start_head[:8]}`"
+
+    why = reason + (f" — {facts['message']}" if facts["message"] else "")
     lines = [
-        f"# Task {task_id} — interrupted",
+        f"# {task_id} — interrupted",
         "",
-        f"- **Stopped because:** {reason}",
-        f"- **When:** {now_iso()}",
-        f"- **Attempt:** {attempt}",
-        f"- **Session:** `{session_id or 'not captured'}`",
-        f"- **Working directory:** `{repo or 'not recorded'}`",
+        f"**Why:** {why}",
+        f"**When:** {when or now_iso()} · {' · '.join(meta)}",
+        f"**Where:** {where}",
         "",
-        "## What was asked",
+        "## Task",
         "",
         prompt.strip() or "_(empty)_",
         "",
+        "## Changed",
+        "",
+        *_changed(repo, start_head),
+        "",
+        "## Resume",
+        "",
     ]
-
-    commits = commits_since(repo, start_head)
-    lines += ["## What landed on disk", ""]
-    if commits:
-        for sha, subject in commits:
-            lines.append(f"- `{sha}` {subject}")
-        stat = _git(repo, "diff", "--stat", f"{start_head}..HEAD") if start_head else ""
-        if stat:
-            lines += ["", "```", stat, "```"]
-    elif repo:
-        dirty = _git(repo, "status", "--porcelain")
-        if dirty:
-            lines += [
-                "Uncommitted changes were left in the tree:",
-                "", "```", dirty[:2000], "```",
-            ]
-        else:
-            lines.append("Nothing. The working tree is unchanged.")
-    else:
-        lines.append("Not a git repository, so no record of file changes.")
-    lines.append("")
-
-    if result_text.strip():
+    if session_id:
         lines += [
-            "## Last thing the session said",
-            "",
             "```",
-            result_text.strip()[-2000:],
+            f"claude --resume {session_id}",
             "```",
             "",
+            "That replays the real conversation and is the preferred route. "
+            "Fall back to this file only if the session will not open — the "
+            "work under **Changed** is already done, so continue from it.",
         ]
-
-    lines += [
-        "## Picking it up",
-        "",
-        "Resuming the session replays the real conversation and is preferred. "
-        "This file is the fallback for when that session can no longer be "
-        "opened — treat the work above as already done and continue from it.",
-        "",
-    ]
+    else:
+        lines.append(
+            "No session id was captured, so the conversation cannot be "
+            "reopened. Treat the work under **Changed** as done and continue."
+        )
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -217,6 +295,60 @@ def recent(db_path: Path, limit: int = 20) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def render(md: str) -> str:
+    """Colour a handover for a terminal.
+
+    Returns the markdown untouched when colour is off, which is also what
+    happens when stdout is redirected -- so `bq summary x > handover.md`
+    still writes a clean document.
+    """
+    if not ansi.enabled():
+        return md
+
+    out, in_code = [], False
+    for line in md.splitlines():
+        if line.startswith("```"):
+            in_code = not in_code
+            continue                      # the fence is noise on a screen
+        if in_code:
+            out.append("    " + ansi.cmd(line))
+        elif line.startswith("# "):
+            out.append(ansi.head(line[2:]))
+        elif line.startswith("## "):
+            out.append(ansi.paint(line[3:], "bold"))
+        elif line.startswith("**") and "**" in line[2:]:
+            lab, _, rest = line[2:].partition("**")
+            out.append(f"{ansi.label(lab)}{rest}")
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+MARKS = {
+    "interrupted": ("~", "yellow"),
+    "done": ("+", "green"),
+    "failed": ("!", "red"),
+}
+
+
+def format_row(r: dict) -> str:
+    """One run, as a few indented lines under a coloured status mark."""
+    mark, colour = MARKS.get(r["status"], ("?", "grey"))
+    head = (f"{ansi.paint(mark, colour)} run {r['run_id']:>4}  "
+            f"{ansi.paint('[' + r['task_id'] + ']', 'cyan')}  "
+            f"{ansi.paint(r['status'], colour):<11} {r['ended'] or ''}")
+    lines = [head, f"        {(r['prompt'] or '')[:90]}"]
+    if r["repo"]:
+        lines.append(f"        {ansi.label('repo')} {r['repo']} @ {r['repo_head'] or '?'}")
+    if r["session_id"]:
+        # A bare id is something to copy and then work out what to do with.
+        # The command is the thing the reader actually wants.
+        lines.append(f"        {ansi.cmd('claude --resume ' + r['session_id'])}")
+    if r["reason"]:
+        lines.append(f"        {ansi.warn(r['reason'])}")
+    return "\n".join(lines)
+
+
 def main() -> int:
     import argparse
     import sys
@@ -237,7 +369,8 @@ def main() -> int:
 
     if args.summary:
         text = latest_summary(db, args.summary)
-        print(text or f"No summary recorded for {args.summary}.")
+        print(render(text) if text else
+              f"No summary recorded for {args.summary}.")
         return 0 if text else 1
 
     rows = recent(db, args.limit)
@@ -248,16 +381,7 @@ def main() -> int:
         print("No sessions recorded yet.")
         return 0
     for r in rows:
-        mark = {"interrupted": "~", "done": "+", "failed": "!"}.get(r["status"], "?")
-        print(f"{mark} run {r['run_id']:>4}  [{r['task_id']}]  {r['status']:<11} "
-              f"{r['ended'] or ''}")
-        print(f"        {(r['prompt'] or '')[:90]}")
-        if r["repo"]:
-            print(f"        repo {r['repo']} @ {r['repo_head'] or '?'}")
-        if r["session_id"]:
-            print(f"        session {r['session_id']}")
-        if r["reason"]:
-            print(f"        {r['reason']}")
+        print(format_row(r))
     return 0
 
 

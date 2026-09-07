@@ -55,7 +55,7 @@ def test_summary_names_what_was_asked_and_why_it_stopped():
     assert "rewrite the booking flow" in md
     assert "session limit" in md
     assert "sess-1" in md
-    assert "Attempt:** 2" in md
+    assert "attempt 2" in md
 
 
 def test_summary_lists_the_commits_the_attempt_made(repo):
@@ -69,7 +69,7 @@ def test_summary_lists_the_commits_the_attempt_made(repo):
         start_head=head, attempt=1, reason="session limit",
     )
     assert "half the work" in md
-    assert "app.py" in md  # diffstat
+    assert "app.py" in md  # the files that actually moved
 
 
 def test_summary_reports_an_untouched_tree_honestly(repo):
@@ -87,7 +87,7 @@ def test_summary_mentions_uncommitted_leftovers(repo):
         task_id="abc", prompt="do it", session_id=None, repo=str(repo),
         start_head=head, attempt=1, reason="session limit",
     )
-    assert "Uncommitted changes" in md
+    assert "## Changed" in md
     assert "app.py" in md
 
 

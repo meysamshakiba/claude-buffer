@@ -276,6 +276,18 @@ bq summary <task-id>   # the markdown handover for one task
 Records land in `~/.claude/buffer/sessions.db` (SQLite) with the markdown kept
 both in the row and as a file under `summaries/`.
 
+The handover is deliberately short -- why it stopped, what already landed, and
+the command to continue -- because it is read by someone working out what
+happened, often on a phone. The CLI's result JSON is parsed down to the one
+sentence that matters (`You've hit your session limit, resets 12:30pm`) rather
+than pasted in whole; the token counts and per-model costs it carries are noise
+in a document whose job is to be read.
+
+Output is coloured when it is going to a terminal, and plain when it isn't --
+so `bq summary <id> > handover.md` writes clean markdown with no escape codes.
+Set `NO_COLOR=1` to switch it off, or `FORCE_COLOR=1` to keep it through a
+pipe such as `| less -R`.
+
 **Resuming still comes first.** Reopening the conversation replays the real
 thing and beats any summary of it. The handover is what happens when that is
 impossible -- an expired, pruned, or foreign session -- and instead of starting
