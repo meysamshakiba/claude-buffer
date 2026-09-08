@@ -227,14 +227,35 @@ One notification per event:
 |---|---|
 | Task started | which task, and the directory it runs in |
 | Task done | which task finished, and whether it took the API-key path |
-| Task failed | the task, the attempts it used, and the last line of output |
-| Usage limit | which limit, when it resets, and what the daemon does until then |
+| Task failed | the plan, then the handover: why it stopped, what landed, how to resume |
+| Usage limit | which limit, when it resets, what happens next — then the same handover |
 | Queue drained | the tally — `3 done, 1 failed. Nothing left in the queue.` |
 
 A retry that is going to run again is deliberately silent, and so is a daemon
 that starts up with an empty queue: a supervisor waking every 15 minutes would
 otherwise send 96 notifications a day saying nothing. A failure is the only
 event that arrives at a priority meant to be noticed at night.
+
+The two events that mean *the work stopped* carry the handover itself rather
+than a one-liner, squeezed into ntfy's 4096-byte message limit:
+
+```
+weekly limit hit on [a1b2]. Resets Mon 09:00; sleeping 41m, then [a1b2] continues.
+
+Why: weekly limit — You've hit your weekly limit · resets 9:00am
+
+Changed:
+- `c7c4dba` buffer[a1b2]: wire the parser through
+- `M` scripts/parse.py
+- ...and 14 more
+
+claude --resume 47798101-4a7e
+```
+
+The file list is cut on a line boundary and says how many it dropped. The
+`claude --resume` line is reserved out of the budget before anything else is
+measured, so it is never the thing that gets cut — it is the only line in
+there you cannot reconstruct from the repository.
 
 **Unset means off.** With no topic configured, nothing is sent and no request
 is made — the daemon behaves exactly as it did before this existed.
@@ -253,6 +274,39 @@ password rather than a name. And the daemon inherits its environment when it is
 `bq stop` and let the next one pick it up. `bq` prints `ntfy: <url>` next to the
 daemon status, which is the quickest way to catch a topic that never made it
 across.
+
+### Attaching the full handover (off by default)
+
+The digest is a summary of a summary. The whole markdown file can ride along
+as an ntfy attachment instead:
+
+```bash
+export BUFFER_NTFY_ATTACH=1      # any value but 0/false/no/off turns it on
+```
+
+It arrives as a second, silent notification (priority 1) next to the message,
+so the phone still buzzes once. Unset — the default — nothing is uploaded and
+no PUT is made.
+
+**Read this before turning it on.** It is off by default for two reasons that
+do not apply to a one-line message:
+
+- **The topic is public and unauthenticated.** Anyone who knows or guesses the
+  topic name can read anything posted to it, and a handover is a richer thing
+  to leak than a task title: commit subjects, file paths, and whatever the CLI
+  said before it stopped. On ntfy.sh there is no password on that door.
+- **ntfy.sh deletes attachments after 3 hours.** Until then the file sits on a
+  third party's disk, reachable by URL. The link in a notification you open the
+  next morning will usually be dead — the copy under `~/.claude/buffer/summaries/`
+  is the one that lasts, and `bq summary <task-id>` prints it.
+
+Files larger than ntfy.sh's 15MB cap are skipped with a line in the log rather
+than uploaded; a handover never comes close, but the daemon checks before it
+sends anything. A refused, oversized, or unreachable upload is logged and
+ignored: nothing about attachments can stop the queue draining.
+
+Self-hosting ntfy addresses both bullets — you set the retention and the access
+control — and needs no change here beyond `BUFFER_NTFY_URL`.
 
 ## 8. Handover across a usage limit
 

@@ -245,6 +245,95 @@ def build_summary(
     return "\n".join(lines)
 
 
+DIGEST_LIMIT = 4096      # ntfy's cap on one message body, in bytes
+NO_SESSION = "No session id was captured; continue from the changes above."
+
+
+def _bytes(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def _clip(text: str, room: int) -> str:
+    """The longest prefix of `text` fitting in `room` bytes.
+
+    Cut between characters, not inside one: half an encoded character arrives
+    on the phone as a replacement glyph.
+    """
+    if _bytes(text) <= room:
+        return text
+    return text.encode("utf-8")[:max(0, room)].decode("utf-8", "ignore")
+
+
+def _fit(lines: list[str], room: int) -> tuple[list[str], int]:
+    """As many whole lines as fit in `room` bytes, and how many were dropped."""
+    kept, used = [], 0
+    for i, line in enumerate(lines):
+        cost = _bytes(line) + 1               # +1 for the newline joining it on
+        if used + cost > room:
+            return kept, len(lines) - i
+        kept.append(line)
+        used += cost
+    return kept, 0
+
+
+def digest(md: str, lead: str = "", limit: int = DIGEST_LIMIT) -> str:
+    """Squeeze a handover into one push notification.
+
+    A phone is not a document viewer. ntfy caps a message at DIGEST_LIMIT
+    bytes, and what the reader actually sees is a few lines on a lock screen.
+    So this keeps the three things worth reading at 3am -- why it stopped,
+    what already landed, and the command that continues it -- and drops the
+    rest of the file, which is still on disk for whoever wants it.
+
+    `lead` goes first, for what the handover itself cannot know: the daemon's
+    plan. "Sleeping 40m, then it continues" is the sentence that decides
+    whether you get up.
+
+    The resume command is reserved out of the budget before anything else is
+    measured, so an attempt that touched sixty files loses file names rather
+    than the one line telling you how to carry on. Everything is counted in
+    bytes rather than characters, because ntfy's limit is bytes and a task
+    written in Japanese is three times its own length.
+    """
+    lines = (md or "").splitlines()
+
+    why = next((ln for ln in lines if ln.startswith("**Why:**")), "")
+    why = why.replace("**", "").strip()
+    resume = next((ln.strip() for ln in lines
+                   if ln.strip().startswith("claude --resume ")), "")
+
+    changed, in_changed = [], False
+    for ln in lines:
+        if ln.startswith("## "):
+            in_changed = ln[3:].strip().lower() == "changed"
+        elif in_changed and ln.strip():
+            changed.append(ln.rstrip())
+
+    tail = f"\n\n{resume or NO_SESSION}"
+    room = limit - _bytes(tail)
+    if room <= 0:
+        return resume            # pathological, but the command is still the point
+
+    body = _clip("\n\n".join([ln for ln in (lead.strip(), why) if ln]), room)
+    room -= _bytes(body)
+
+    if changed and room > 0:
+        block = ["", "Changed:", *changed]         # "" is the blank line before it
+        kept, dropped = _fit(block, room)
+        if dropped:
+            # Say the list is partial. A count costs one line and stops the
+            # reader trusting a truncation as the whole story -- so reserve
+            # room for it first, at its widest, and refit.
+            reserve = _bytes(f"- ...and {len(changed)} more") + 1
+            kept, dropped = _fit(block, room - reserve)
+            if len(kept) > 2:
+                kept.append(f"- ...and {dropped} more")
+        if len(kept) > 2:                          # more than the label alone
+            body += "\n" + "\n".join(kept)
+
+    return body + tail
+
+
 def record(
     db_path: Path,
     *,

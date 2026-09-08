@@ -645,6 +645,51 @@ def queue_op(path: Path, fn, retries: int = 3):
     return None
 
 
+# -- handover --------------------------------------------------------------
+
+
+def write_handover(**kw) -> tuple[str, Path | None]:
+    """Assemble the handover and file it under summaries/.
+
+    Returns the markdown and where it landed -- None if it could not be
+    written, because bookkeeping must never cost us the queue. The markdown
+    comes back either way: it is still worth sending to a phone even when the
+    disk it was meant for refused it.
+    """
+    summary = sessions.build_summary(**kw)
+    try:
+        summaries_dir().mkdir(parents=True, exist_ok=True)
+        md = summaries_dir() / f"{kw['task_id']}-{int(time.time())}.md"
+        md.write_text(summary, encoding="utf-8")
+        log(f"Wrote handover {md.name}")
+        return summary, md
+    except OSError as exc:
+        log(f"Could not write the handover: {exc}")
+        return summary, None
+
+
+def announce(kind: str, tid: str, lead: str, summary: str = "",
+             md: Path | None = None) -> None:
+    """Send an event that carries the handover, not just a one-liner.
+
+    "Usage limit" on its own sends you to the machine to find out what
+    happened, which is the trip the notification existed to save. The digest
+    puts why it stopped, what landed and the resume command in the message
+    itself. The file goes too when BUFFER_NTFY_ATTACH says so -- and a failed
+    upload is not allowed to matter, so nothing here is checked.
+    """
+    notify.event(kind, sessions.digest(summary, lead=lead) if summary else lead)
+    if md:
+        notify.attach(
+            md, title=f"Handover [{tid}]", tags="paperclip",
+            # Minimum priority: the message above already buzzed, and this is
+            # the same news with a file stapled to it.
+            priority=1,
+            message=f"full handover; ntfy deletes it after "
+                    f"{notify.ATTACH_EXPIRY_HOURS}h",
+        )
+
+
 def drain(args, path: Path) -> int:
     use_state_for(path)
 
@@ -778,7 +823,9 @@ def drain(args, path: Path) -> int:
             note = f"limit detected {MAX_LIMIT_HITS}x without progress; giving up"
             queue_op(path, lambda q: q.set_status(tid, "failed", note))
             completed["failed"] += 1
-            notify.event("failed", f"[{tid}] {text}\n{note}")
+            # Its own handover was written by the limit that preceded it, and
+            # the file went out with that notification; the text is enough here.
+            announce("failed", tid, f"[{tid}] {text}\n{note}", handover or "")
             log(f"Giving up on [{tid}]: {note}")
             continue
 
@@ -798,24 +845,20 @@ def drain(args, path: Path) -> int:
             # evidence is fresh. Nothing inside the session could have done
             # this: it was stopped mid-token, and summarising needs a model
             # call, which is the one thing a lockout forbids.
+            summary, md = write_handover(
+                task_id=tid, prompt=text, session_id=interrupted,
+                repo=task_cwd, start_head=start_head,
+                attempt=attempts[tid] + 1, reason=f"{kind} limit",
+                result_text=output,
+            )
             try:
-                summary = sessions.build_summary(
-                    task_id=tid, prompt=text, session_id=interrupted,
-                    repo=task_cwd, start_head=start_head,
-                    attempt=attempts[tid] + 1, reason=f"{kind} limit",
-                    result_text=output,
-                )
-                summaries_dir().mkdir(parents=True, exist_ok=True)
-                md = summaries_dir() / f"{tid}-{int(time.time())}.md"
-                md.write_text(summary, encoding="utf-8")
                 sessions.record(
                     db_path(), task_id=tid, prompt=text, session_id=interrupted,
                     repo=task_cwd, repo_head=start_head, status="interrupted",
                     reason=f"{kind} limit", attempt=attempts[tid] + 1,
-                    summary=summary, summary_path=str(md),
+                    summary=summary, summary_path=str(md) if md else None,
                 )
-                log(f"Wrote handover {md.name}")
-            except (OSError, sqlite3.Error) as exc:
+            except sqlite3.Error as exc:
                 # Bookkeeping must never cost us the queue.
                 log(f"Could not record the handover: {exc}")
 
@@ -824,9 +867,10 @@ def drain(args, path: Path) -> int:
             use_fallback = bool(
                 args.fallback_api_key and os.environ.get("BUFFER_FALLBACK_API_KEY")
             )
-            notify.event(
-                "limit",
+            announce(
+                "limit", tid,
                 limit_message(kind, tid, reset_epoch, args.max_sleep, use_fallback),
+                summary, md,
             )
 
             if use_fallback:
@@ -895,7 +939,18 @@ def drain(args, path: Path) -> int:
 
         # Close the record either way, so the database shows how a task ended
         # and not only that it once stalled.
+        summary, md = "", None
         if ok or attempts[tid] >= args.max_retries:
+            if not ok:
+                # A task out of attempts needs the same handover a limited one
+                # gets: it stopped halfway too, and left the same three
+                # questions -- why, what landed, how to carry on.
+                summary, md = write_handover(
+                    task_id=tid, prompt=text, session_id=session_id,
+                    repo=task_cwd, start_head=start_head,
+                    attempt=attempts[tid], reason="failed",
+                    result_text=output,
+                )
             try:
                 sessions.record(
                     db_path(), task_id=tid, prompt=text, session_id=session_id,
@@ -903,6 +958,7 @@ def drain(args, path: Path) -> int:
                     status="done" if ok else "failed",
                     reason="" if ok else "attempts exhausted",
                     attempt=attempts[tid],
+                    summary=summary, summary_path=str(md) if md else None,
                 )
             except sqlite3.Error as exc:
                 log(f"Could not record the run: {exc}")
@@ -924,9 +980,10 @@ def drain(args, path: Path) -> int:
             tail = output.strip().splitlines()[-1] if output.strip() else "no output"
             queue_op(path, lambda q: q.set_status(tid, "failed", tail[:160]))
             completed["failed"] += 1
-            notify.event(
-                "failed",
+            announce(
+                "failed", tid,
                 f"[{tid}] {text}\nGave up after {attempts[tid]} attempts: {tail[:160]}",
+                summary, md,
             )
             log(f"Giving up on [{tid}] after {attempts[tid]} attempts.")
 
@@ -1063,6 +1120,10 @@ def main() -> int:
         # inherits its environment at spawn time, so one started before the
         # topic was exported is posting nowhere regardless of what this says.
         target = notify.endpoint()
+        # Uploading handovers to a public topic is worth stating out loud, in
+        # the one place someone looks to check where notifications are going.
+        if target and notify.attaching():
+            target += "  (+ handover attachments, public for 3h)"
         if not pid:
             print("no daemon running")
             if target:

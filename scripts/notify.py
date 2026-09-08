@@ -12,10 +12,11 @@ Subscribing is installing the app and typing the topic name.
 
     export BUFFER_NTFY_TOPIC=buffer-9f3a1c7d          # topic to publish to
     export BUFFER_NTFY_URL=https://ntfy.example.com   # optional, for self-hosted
+    export BUFFER_NTFY_ATTACH=1                       # optional, upload files too
 
-With neither set this module does nothing at all: no request, no error, no log
-line. Notifications are opt-in, and a daemon without them configured has to
-behave exactly as it did before they existed.
+With neither of the first two set this module does nothing at all: no request,
+no error, no log line. Notifications are opt-in, and a daemon without them
+configured has to behave exactly as it did before they existed.
 
 A topic name is the only secret involved -- anyone who knows it can read your
 task titles and post to it. Use an unguessable one rather than "buffer".
@@ -28,11 +29,21 @@ import os
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from pathlib import Path
 from urllib.parse import urlsplit
 
 DEFAULT_SERVER = "https://ntfy.sh"
 TIMEOUT = 10        # a phone service that hangs must not hold up the queue
-MAX_BODY = 3800     # ntfy rejects an oversized message; truncate instead
+MAX_BODY = 4096     # ntfy's cap on a message body, in bytes; truncate instead
+
+# Attachments are a different bargain from messages, so they are opt-in --
+# see attaching(). ntfy.sh refuses anything past ATTACH_MAX and deletes what
+# it accepted after ATTACH_EXPIRY_HOURS.
+ATTACH_ENV = "BUFFER_NTFY_ATTACH"
+ATTACH_MAX = 15 * 1024 * 1024
+ATTACH_EXPIRY_HOURS = 3
+ATTACH_TIMEOUT = 60         # 15MB over a phone-grade uplink is not 10 seconds
+OFF = ("", "0", "false", "no", "off")
 
 # kind -> (title, tags, priority). Priorities are ntfy's 1..5, and the choice
 # is about sleep: at 3am a failure is the only thing worth a buzz, and a task
@@ -108,33 +119,104 @@ def _header(value: str, limit: int = 200) -> str:
     return " ".join(value.split()).encode("ascii", "ignore").decode("ascii")[:limit]
 
 
-def post(message: str, *, title: str = "", tags: str = "",
-         priority: int | None = None, url: str | None = None) -> bool:
-    """POST one notification. True if it went out.
-
-    Never raises. A phone that cannot be reached is not a reason to stop
-    draining a queue -- the queue is the thing that must not be lost.
-    """
-    target = url or endpoint()
-    if not target:
-        return False
-
-    headers = {"Content-Type": "text/plain; charset=utf-8"}
+def _meta(title: str, tags: str, priority: int | None) -> dict[str, str]:
+    """The headers a message and an upload label themselves with, identically."""
+    headers = {}
     if title:
         headers["Title"] = _header(title)
     if tags:
         headers["Tags"] = _header(tags)
     if priority:
         headers["Priority"] = str(priority)
+    return headers
 
-    body = (message or "").strip()[:MAX_BODY].encode("utf-8")
-    req = urllib.request.Request(target, data=body, headers=headers, method="POST")
+
+def _send(req, target: str, what: str, timeout: int = TIMEOUT) -> bool:
+    """Make the request. True if it was accepted; never raises.
+
+    A phone that cannot be reached is not a reason to stop draining a queue --
+    the queue is the thing that must not be lost.
+    """
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return 200 <= resp.status < 300
     except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
-        _reporter(f"could not notify {target}: {exc}")
+        _reporter(f"could not {what} {target}: {exc}")
         return False
+
+
+def post(message: str, *, title: str = "", tags: str = "",
+         priority: int | None = None, url: str | None = None) -> bool:
+    """POST one notification. True if it went out."""
+    target = url or endpoint()
+    if not target:
+        return False
+
+    headers = {"Content-Type": "text/plain; charset=utf-8",
+               **_meta(title, tags, priority)}
+
+    # Cut on bytes, not characters: the cap is a byte count, and a message
+    # measured in characters can be well over it in any language that doesn't
+    # fit in one byte each. Decoding with "ignore" drops a half-encoded tail.
+    body = (message or "").strip().encode("utf-8")[:MAX_BODY]
+    body = body.decode("utf-8", "ignore").encode("utf-8")
+
+    req = urllib.request.Request(target, data=body, headers=headers, method="POST")
+    return _send(req, target, "notify")
+
+
+def attaching() -> bool:
+    """Whether uploading files is switched on. Off unless asked for.
+
+    An attachment is a bigger commitment than a message. On ntfy.sh a topic is
+    public and unauthenticated, so a handover posted there -- file names,
+    commit subjects, whatever the CLI said -- is readable by anyone who
+    guesses the topic, and it sits on someone else's server for three hours
+    before being deleted. A one-line notification is a reasonable default; a
+    document is a decision the user gets to make.
+    """
+    return (os.environ.get(ATTACH_ENV) or "").strip().lower() not in OFF
+
+
+def attach(path: str | Path, *, title: str = "", tags: str = "",
+           priority: int | None = None, message: str = "",
+           url: str | None = None) -> bool:
+    """Upload a file to the topic as an ntfy attachment. True if it went up.
+
+    ntfy takes the file as the request body and its name in a header, which
+    makes this a PUT rather than the POST a message uses.
+
+    Returns False without a request when attachments are off, when the file is
+    past ntfy's size cap, or when it cannot be read. Like post(), it never
+    raises: an upload nobody receives is a strictly smaller problem than a
+    drain that stopped.
+    """
+    if not attaching():
+        return False
+    target = url or endpoint()
+    if not target:
+        return False
+
+    path = Path(path)
+    try:
+        size = path.stat().st_size
+        if size > ATTACH_MAX:
+            _reporter(f"{path.name} is {size // 1024}KB, past ntfy's "
+                      f"{ATTACH_MAX // (1024 * 1024)}MB attachment cap; not attaching")
+            return False
+        data = path.read_bytes()
+    except OSError as exc:
+        _reporter(f"could not read {path}: {exc}")
+        return False
+
+    headers = {"Content-Type": "application/octet-stream",
+               "Filename": _header(path.name, 120),
+               **_meta(title, tags, priority)}
+    if message:
+        headers["Message"] = _header(message, 400)
+
+    req = urllib.request.Request(target, data=data, headers=headers, method="PUT")
+    return _send(req, target, "attach to", timeout=ATTACH_TIMEOUT)
 
 
 def event(kind: str, message: str) -> bool:
