@@ -36,6 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import notify
+import repairs
 import sessions
 from buffer_queue import (
     STALE_AFTER,
@@ -686,6 +687,11 @@ def drain(args, path: Path) -> int:
 
     attempts: dict[str, int] = {}
     limit_hits: dict[str, int] = {}
+    repaired: set[str] = set()
+    repair_rules = repairs.load(state_dir(), warn=log)
+    if repair_rules:
+        log(f"Loaded {len(repair_rules)} repair rule(s) from "
+            f"{repairs.config_path(state_dir())}.")
     chain_session: str | None = None
     completed = {"done": 0, "failed": 0}
 
@@ -875,6 +881,26 @@ def drain(args, path: Path) -> int:
                           reason="limit, reset time unknown")
                 time.sleep(DEFAULT_BACKOFF)
             continue
+
+        # A failure that says the machine wasn't ready is not the task's
+        # fault, and at 05:00 there is nobody to read "start the emulator and
+        # try again". Run the fix the user configured for it, then retry --
+        # once per task, so a repair that doesn't help fails the task as before.
+        if not ok and tid not in repaired:
+            rule = repairs.match(repair_rules, output)
+            if rule is not None:
+                repaired.add(tid)
+                attempts[tid] -= 1  # the precondition, not the task, failed
+                log(f"[{tid}] looks like a precondition failure; running "
+                    f"repair '{rule.name}'.")
+                fixed, repair_out = repairs.apply(rule, task_cwd)
+                if not fixed:
+                    log(f"Repair '{rule.name}' failed: "
+                        f"{repair_out.splitlines()[-1] if repair_out else 'no output'}")
+                else:
+                    log(f"Repair '{rule.name}' finished; retrying [{tid}].")
+                queue_op(path, lambda q: q.set_status(tid, "pending", f"repair: {rule.name}"))
+                continue
 
         # Commit on failure too: a task that got halfway leaves edits behind,
         # and they need to be as visible and revertable as a successful one's.

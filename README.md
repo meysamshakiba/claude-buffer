@@ -59,11 +59,37 @@ commands/buffer.md    the /buffer slash command
 scripts/buffer_queue.py   queue state: add, claim, done, fail, list
 scripts/drain.py          the daemon: executes tasks, sleeps through limits
 scripts/notify.py         ntfy push notifications, off unless a topic is set
+scripts/repairs.py        fix-and-retry rules for precondition failures
 bin/bq, bin/bq.cmd        shell entry point (POSIX / Windows)
 ```
 
 State lives in `~/.claude/buffer/` — `queue.md` (plain markdown, hand-editable),
 `drain.log`, `drain.pid`. Override the location with `CLAUDE_BUFFER_QUEUE`.
+
+## Fixing the machine instead of reporting it
+
+A 05:00 task that dies on "No device attached. Start the emulator" is not a task
+failure — it's a machine that wasn't ready, reported to someone who is asleep.
+Put the fix next to the symptom in `~/.claude/buffer/repairs.json`:
+
+```json
+{"rules": [
+  {"name": "android emulator",
+   "match": "no device attached|no devices/emulators found|device offline",
+   "run": ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+           "-File", "C:/dev/emulator_check.ps1", "-CreateAvd"],
+   "timeout": 600}
+]}
+```
+
+When a task fails and its output matches `match`, the daemon runs `run`, then
+retries the task once — resuming the same conversation, and without spending a
+retry. If it fails the same way again the failure is real and is reported as
+before. `run` may be an argument list or a shell string (`"docker compose up
+-d"`); `cwd` and `timeout` (default 600s) are optional, and
+`CLAUDE_BUFFER_REPAIRS` moves the file. No file means no repairs: these run
+commands, so nothing is enabled by default. See
+[examples/repairs.json](examples/repairs.json).
 
 ## Notes
 

@@ -318,7 +318,39 @@ effect on a daemon that's already running.
 On a usage limit the daemon retries the task on the API key instead of sleeping.
 This costs money per token — that's the trade. Without the flag it just waits.
 
-## 10. Flags
+## 10. Run the fix instead of reporting it (optional)
+
+Some failures are the machine, not the task:
+
+```
+❌ The 05:00 sweep crashed: No device attached. Start the emulator
+   (.\emulator_check.ps1 -CreateAvd) and try again.
+```
+
+Nobody is awake at 05:00 to read that. Write `~/.claude/buffer/repairs.json`
+(or point `CLAUDE_BUFFER_REPAIRS` elsewhere):
+
+```json
+{"rules": [
+  {"name": "android emulator",
+   "match": "no device attached|no devices/emulators found|device offline",
+   "run": ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+           "-File", "C:/dev/emulator_check.ps1", "-CreateAvd"],
+   "timeout": 600}
+]}
+```
+
+The daemon matches the pattern (case-insensitively) against the output of a
+failed task, runs the command, and retries the task once — same conversation,
+no retry consumed. A second failure of the same shape is reported as usual, so
+a repair that doesn't help costs one extra attempt, not an endless loop. Check
+`python3 .../drain.py --tail` for the `running repair '<name>'` lines.
+
+`run` can also be a shell string (`"docker compose up -d"`), and `cwd` sets
+where it runs. With no config file nothing changes: repairs execute commands,
+so they only come from a file you wrote.
+
+## 11. Flags
 
 | Flag | Why |
 |---|---|
@@ -348,7 +380,7 @@ be set for whatever starts the daemon rather than typed each time:
 `CLAUDE_BUFFER_QUEUE` (§3), `CLAUDE_BUFFER_INBOX` (§5), `BUFFER_NTFY_TOPIC` and
 `BUFFER_NTFY_URL` (§7), and `BUFFER_FALLBACK_API_KEY` (§9).
 
-## 11. Windows notes
+## 12. Windows notes
 
 Supported natively. You install `bin\bq.cmd` rather than `bin/bq`, but you
 still *type* `bq` — PowerShell and cmd resolve it through `PATHEXT`.

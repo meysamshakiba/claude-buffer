@@ -1,0 +1,18 @@
+{
+  "rules": [
+    {
+      "name": "android emulator",
+      "match": "no device attached|no devices/emulators found|device (?:offline|unauthorized)",
+      "run": ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+              "-File", "C:/dev/emulator_check.ps1", "-CreateAvd"],
+      "timeout": 600
+    },
+    {
+      "name": "docker compose up",
+      "match": "cannot connect to the docker daemon|connection refused.*:5432",
+      "run": "docker compose up -d",
+      "timeout": 300,
+      "cwd": "C:/dev/myproject"
+    }
+  ]
+}

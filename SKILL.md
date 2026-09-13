@@ -133,6 +133,17 @@ lives on the task in `queue.md`, so it survives the daemon being stopped
 mid-wait. If the conversation can't be reopened, the task runs cold rather than
 stalling on a chat that no longer exists.
 
+**It can fix the machine and retry.** A failure that says a precondition was
+missing — "No device attached", the Docker daemon down — is the machine, not
+the task, and at 05:00 there is nobody to act on the advice in the message. If
+`~/.claude/buffer/repairs.json` (or `CLAUDE_BUFFER_REPAIRS`) holds a rule whose
+`match` regex appears in a failed task's output, the daemon runs that rule's
+`run` command and retries the task once, in the same session and without
+spending a retry; a second failure of the same shape is reported as before.
+When a user is told to run some setup script "and try again", offer them a rule
+for it. Rules run commands, so they exist only in a file the user wrote — never
+enable one silently.
+
 **It can push to a phone.** If `BUFFER_NTFY_TOPIC` is set, the daemon posts one
 [ntfy](https://ntfy.sh) notification per event — task started, done, failed,
 usage limit hit (with the reset time and what it will do until then), queue
